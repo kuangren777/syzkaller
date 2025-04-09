@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -282,6 +283,16 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		saturatedCalls:     make(map[string]bool),
 		reportGenerator:    manager.ReportGeneratorCache(cfg),
 	}
+
+	// 测试LLM API是否可用
+	if cfg.Experimental.LLMAPIEnabled {
+		if err := testLLMAPIAvailability(cfg.Experimental.LLMAPIURL); err != nil {
+			log.Errorf("LLM API测试失败: %v", err)
+		} else {
+			log.Logf(0, "LLM API测试成功，API可用")
+		}
+	}
+
 	if *flagDebug {
 		mgr.cfg.Procs = 1
 	}
@@ -378,6 +389,11 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
 	mgr.pool.Loop(ctx)
+
+	// 保存系统调用信息
+	if err := mgr.saveSyscallInfo(); err != nil {
+		log.Errorf("保存系统调用信息失败: %v", err)
+	}
 }
 
 // Exit successfully in special operation modes.
@@ -596,8 +612,54 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
 		return
 	}
 	injectExec := make(chan bool, 10)
-	serv.CreateInstance(inst.Index(), injectExec, updInfo)
+	errChan := serv.CreateInstance(inst.Index(), injectExec, updInfo)
 
+	// LLM配置，设置默认值
+	var llmConfig *fuzzer.LLMConfig
+	if mgr.cfg.Experimental.LLMAPIEnabled {
+		// 使用OpenAI标准格式的API URL
+		apiURL := mgr.cfg.Experimental.LLMAPIURL
+		if apiURL == "" {
+			apiURL = "http://100.64.88.112:5231"
+		}
+
+		llmConfig = &fuzzer.LLMConfig{
+			Enabled:         true,
+			APIURL:          apiURL,
+			StallThreshold:  mgr.cfg.Experimental.LLMStallThreshold,
+			UsageFrequency:  mgr.cfg.Experimental.LLMUsageFrequency,
+			UseOpenAIFormat: true, // 使用OpenAI标准格式
+		}
+		// 设置默认值
+		if llmConfig.StallThreshold == 0 {
+			llmConfig.StallThreshold = 1000
+		}
+		if llmConfig.UsageFrequency == 0 {
+			llmConfig.UsageFrequency = 10
+		}
+		log.Logf(0, "LLM API 已启用: URL=%v, 使用OpenAI格式, 阈值=%v, 频率=%v%%",
+			llmConfig.APIURL, llmConfig.StallThreshold, llmConfig.UsageFrequency)
+	}
+
+	// 创建一个done通道，当函数返回时关闭
+	done := make(chan struct{})
+	defer close(done)
+
+	// 在后台检查实例创建是否有错误
+	var instanceErr error
+	go func() {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				instanceErr = err
+				log.Errorf("实例创建失败: %v", err)
+			}
+		case <-done:
+			// 函数已返回，不需要再检查错误
+		}
+	}()
+
+	// 继续原来的逻辑
 	rep, vmInfo, err := mgr.runInstanceInner(ctx, inst, injectExec, vm.EarlyFinishCb(func() {
 		// Depending on the crash type and kernel config, fuzzing may continue
 		// running for several seconds even after kernel has printed a crash report.
@@ -623,7 +685,9 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
 		}
 	}
 	if err != nil {
-		log.Logf(1, "VM %v: failed with error: %v", inst.Index(), err)
+		log.Errorf("#%d 运行失败: %v", inst.Index(), err)
+	} else if instanceErr != nil {
+		log.Errorf("#%d 实例错误: %v", inst.Index(), instanceErr)
 	}
 }
 
@@ -1268,42 +1332,51 @@ func (mgr *Manager) MaxSignal() signal.Signal {
 	return nil
 }
 
-func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
+func (mgr *Manager) fuzzerLoop(fuzzerObj *fuzzer.Fuzzer) {
+	ctx := context.Background()
+
+	// 创建并启动LLM增强器
+	if mgr.cfg.Experimental.LLMAPIEnabled {
+		enhancer := NewLLMEnhancer(mgr)
+		go enhancer.Run(ctx)
+		log.Logf(0, "LLM增强器已启动，将定期对高覆盖率程序进行增强")
+	}
+
 	for ; ; time.Sleep(time.Second / 2) {
 		if mgr.cfg.Cover && !mgr.cfg.Snapshot {
 			// Distribute new max signal over all instances.
-			newSignal := fuzzer.Cover.GrabSignalDelta()
+			newSignal := fuzzerObj.Cover.GrabSignalDelta()
 			if len(newSignal) != 0 {
-				log.Logf(3, "distributing %d new signal", len(newSignal))
-			}
-			if len(newSignal) != 0 {
+				log.Logf(3, "分发 %d 个新信号", len(newSignal))
 				mgr.serv.DistributeSignalDelta(newSignal)
 			}
 		}
 
 		// Update the state machine.
-		if fuzzer.CandidateTriageFinished() {
+		if fuzzerObj.CandidateTriageFinished() {
 			if mgr.mode == ModeCorpusTriage {
 				mgr.exit("corpus triage")
-			}
-			mgr.mu.Lock()
-			if mgr.phase == phaseLoadedCorpus {
-				if !mgr.cfg.Snapshot {
-					mgr.serv.TriagedCorpus()
-				}
-				if mgr.cfg.HubClient != "" {
-					mgr.setPhaseLocked(phaseTriagedCorpus)
-					go mgr.hubSyncLoop(pickGetter(mgr.cfg.HubKey),
-						fuzzer.Config.EnabledCalls)
-				} else {
+			} else {
+				mgr.mu.Lock()
+				if mgr.phase == phaseLoadedCorpus {
+					if !mgr.cfg.Snapshot {
+						mgr.serv.TriagedCorpus()
+					}
+					if mgr.cfg.HubClient != "" {
+						mgr.setPhaseLocked(phaseTriagedCorpus)
+						go mgr.hubSyncLoop(pickGetter(mgr.cfg.HubKey),
+							fuzzerObj.Config.EnabledCalls)
+					} else {
+						mgr.setPhaseLocked(phaseTriagedHub)
+					}
+				} else if mgr.phase == phaseQueriedHub {
 					mgr.setPhaseLocked(phaseTriagedHub)
 				}
-			} else if mgr.phase == phaseQueriedHub {
-				mgr.setPhaseLocked(phaseTriagedHub)
+				mgr.mu.Unlock()
 			}
-			mgr.mu.Unlock()
 		}
 	}
+
 }
 
 func (mgr *Manager) setPhaseLocked(newPhase int) {
@@ -1478,4 +1551,260 @@ func publicWebAddr(addr string) string {
 		}
 	}
 	return "http://" + addr
+}
+
+func (mgr *Manager) saveSyscallInfo() error {
+	// 获取系统调用信息
+	syscalls := mgr.target.Syscalls
+	if len(syscalls) == 0 {
+		return fmt.Errorf("没有可用的系统调用")
+	}
+
+	// 准备保存的信息
+	type SyscallInfo struct {
+		Name        string   `json:"name"`
+		Attrs       []string `json:"attrs,omitempty"`
+		Number      uint64   `json:"number"`
+		Args        []string `json:"args"`
+		ReturnType  string   `json:"return_type"`
+		Description string   `json:"description,omitempty"`
+	}
+
+	syscallInfos := make([]SyscallInfo, 0, len(syscalls))
+	for _, syscall := range syscalls {
+		args := make([]string, 0, len(syscall.Args))
+		for _, arg := range syscall.Args {
+			args = append(args, fmt.Sprintf("%s %s", arg.Type.Name(), arg.Name))
+		}
+
+		// 从SyscallAttrs中提取属性
+		attrs := extractSyscallAttrs(syscall.Attrs)
+
+		info := SyscallInfo{
+			Name:       syscall.Name,
+			Attrs:      attrs,
+			Number:     syscall.NR,
+			Args:       args,
+			ReturnType: syscall.Ret.Name(),
+		}
+		syscallInfos = append(syscallInfos, info)
+	}
+
+	// 保存到文件
+	outFile := filepath.Join(mgr.cfg.Workdir, "syscalls_info.json")
+	data, err := json.MarshalIndent(syscallInfos, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化系统调用信息失败: %v", err)
+	}
+
+	err = os.WriteFile(outFile, data, 0644)
+	if err != nil {
+		return fmt.Errorf("保存系统调用信息到文件失败: %v", err)
+	}
+
+	log.Logf(0, "已将 %d 个系统调用信息保存到 %s", len(syscallInfos), outFile)
+	return nil
+}
+
+// 从SyscallAttrs中提取所有非默认值的属性作为字符串列表
+func extractSyscallAttrs(attrs prog.SyscallAttrs) []string {
+	var result []string
+
+	if attrs.Disabled {
+		result = append(result, "disabled")
+	}
+	if attrs.Timeout > 0 {
+		result = append(result, fmt.Sprintf("timeout:%d", attrs.Timeout))
+	}
+	if attrs.ProgTimeout > 0 {
+		result = append(result, fmt.Sprintf("prog_timeout:%d", attrs.ProgTimeout))
+	}
+	if attrs.IgnoreReturn {
+		result = append(result, "ignore_return")
+	}
+	if attrs.BreaksReturns {
+		result = append(result, "breaks_returns")
+	}
+	if attrs.NoGenerate {
+		result = append(result, "no_generate")
+	}
+	if attrs.NoMinimize {
+		result = append(result, "no_minimize")
+	}
+	if attrs.RemoteCover {
+		result = append(result, "remote_cover")
+	}
+	if attrs.Automatic {
+		result = append(result, "automatic")
+	}
+	if attrs.AutomaticHelper {
+		result = append(result, "automatic_helper")
+	}
+	if attrs.Fsck != "" {
+		result = append(result, fmt.Sprintf("fsck:%s", attrs.Fsck))
+	}
+
+	return result
+}
+
+// LLMEnhancer 负责使用LLM增强corpus中的程序
+type LLMEnhancer struct {
+	mgr             *Manager
+	lastEnhanceTime time.Time
+	enhanceInterval time.Duration // 增强间隔时间
+	mu              sync.Mutex
+}
+
+// 创建新的LLM增强器
+func NewLLMEnhancer(mgr *Manager) *LLMEnhancer {
+	return &LLMEnhancer{
+		mgr:             mgr,
+		lastEnhanceTime: time.Now(),
+		enhanceInterval: 30 * time.Second, // 将默认间隔改为30秒
+	}
+}
+
+// 运行LLM增强循环
+func (le *LLMEnhancer) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second): // 每5秒检查一次
+			le.enhanceWithLLM()
+		}
+	}
+}
+
+// 使用LLM进行增强
+func (le *LLMEnhancer) enhanceWithLLM() {
+	le.mu.Lock()
+	defer le.mu.Unlock()
+
+	// 检查是否需要增强
+	if time.Since(le.lastEnhanceTime) < le.enhanceInterval {
+		return
+	}
+
+	le.mgr.mu.Lock()
+	fuzzerObj := le.mgr.fuzzer.Load()
+	le.mgr.mu.Unlock()
+
+	if fuzzerObj == nil {
+		return
+	}
+
+	// 检查LLM配置
+	if fuzzerObj.Config.LLMConfig == nil || !fuzzerObj.Config.LLMConfig.Enabled {
+		return
+	}
+
+	log.Logf(0, "开始从高覆盖率程序中选择候选程序进行LLM增强...")
+
+	// 获取corpus中的程序并按覆盖率排序
+	items := le.mgr.getMinimizedCorpus()
+	if len(items) == 0 {
+		log.Logf(0, "Corpus为空，无法进行LLM增强")
+		return
+	}
+
+	// 按覆盖率排序
+	sort.Slice(items, func(i, j int) bool {
+		return len(items[i].Signal) > len(items[j].Signal)
+	})
+
+	// 取前10个或全部（如果不足10个）
+	topN := 10
+	if len(items) < topN {
+		topN = len(items)
+	}
+
+	// 随机选择一个高覆盖率程序
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	selectedIdx := rnd.Intn(topN)
+	selectedProg := items[selectedIdx].Prog
+
+	log.Logf(0, "从前%d个高覆盖率程序中选择了程序 #%d 进行LLM增强", topN, selectedIdx)
+
+	// 使用LLM增强程序
+	startTime := time.Now()
+	enhancedProg, err := fuzzerObj.UseLLMForMutation(selectedProg.Clone())
+	callDuration := time.Since(startTime)
+
+	if err != nil {
+		log.Errorf("LLM增强失败 (耗时: %v): %v", callDuration, err)
+		return
+	}
+
+	if enhancedProg != nil {
+		log.Logf(0, "成功使用LLM增强程序 (耗时: %v): %s", callDuration, enhancedProg.String())
+
+		// 添加增强后的程序到候选队列
+		candidates := []fuzzer.Candidate{
+			{
+				Prog:  enhancedProg,
+				Flags: 0,
+			},
+		}
+		fuzzerObj.AddCandidates(candidates)
+		log.Logf(0, "已将LLM增强后的程序添加到候选队列")
+	} else {
+		log.Errorf("LLM返回了空程序 (耗时: %v)", callDuration)
+	}
+
+	le.lastEnhanceTime = time.Now()
+}
+
+// 添加LLM API可用性测试函数
+func testLLMAPIAvailability(apiURL string) error {
+	if apiURL == "" {
+		apiURL = "http://100.64.88.112:5231"
+	}
+
+	// 构建一个简单的测试请求
+	type OpenAIMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type OpenAIRequest struct {
+		Model     string          `json:"model"`
+		Messages  []OpenAIMessage `json:"messages"`
+		MaxTokens int             `json:"max_tokens"`
+	}
+
+	messages := []OpenAIMessage{
+		{Role: "system", Content: "你好"},
+		{Role: "user", Content: "测试消息"},
+	}
+
+	reqBody := OpenAIRequest{
+		Model:     "gpt-3.5-turbo",
+		Messages:  messages,
+		MaxTokens: 10,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("序列化测试请求失败: %w", err)
+	}
+
+	// 设置5秒超时
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	log.Logf(0, "正在测试LLM API: %s", apiURL)
+	resp, err := client.Post(apiURL+"/v1/chat/completions", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("连接LLM API失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API返回非200状态码: %d, 响应: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }

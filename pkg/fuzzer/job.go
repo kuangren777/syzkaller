@@ -57,6 +57,22 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 	if p == nil {
 		return nil
 	}
+
+	// 检查是否应该使用LLM API进行变异
+	if fuzzer.ShouldUseLLM() {
+		llmP, err := fuzzer.UseLLMForMutation(p.Clone())
+		if err == nil {
+			fuzzer.Logf(1, "Using LLM mutated program")
+			return &queue.Request{
+				Prog:     llmP,
+				ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
+				Stat:     fuzzer.statExecFuzz,
+			}
+		} else {
+			fuzzer.Logf(1, "LLM mutation failed: %v, falling back to regular mutation", err)
+		}
+	}
+
 	newP := p.Clone()
 	newP.Mutate(rnd,
 		prog.RecommendedCalls,

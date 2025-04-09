@@ -255,6 +255,22 @@ type Experimental struct {
 	// with an empty Filter, but non-empty weight.
 	// E.g. "focus_areas": [ {"filter": {"files": ["^net"]}, "weight": 10.0}, {"weight": 1.0"} ].
 	FocusAreas []FocusArea `json:"focus_areas,omitempty"`
+
+	// LLMAPIEnabled enables the use of LLM API for intelligent mutation when coverage stalls
+	// Default: false
+	LLMAPIEnabled bool `json:"llm_api_enabled,omitempty"`
+
+	// LLMAPIURL is the URL to access the LLM API service
+	// Default: https://kr777.top:5231
+	LLMAPIURL string `json:"llm_api_url,omitempty"`
+
+	// LLMStallThreshold is the number of iterations without new coverage before using LLM
+	// Default value is 1000
+	LLMStallThreshold int `json:"llm_stall_threshold,omitempty"`
+
+	// LLMUsageFrequency controls how often to use LLM when coverage stalls (1-100)
+	// Higher values mean more frequent usage, default is 10 (10% chance)
+	LLMUsageFrequency int `json:"llm_usage_frequency,omitempty"`
 }
 
 type FocusArea struct {

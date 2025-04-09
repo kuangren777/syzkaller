@@ -210,6 +210,7 @@ type Config struct {
 	FetchRawCover  bool
 	NewInputFilter func(call string) bool
 	PatchTest      bool
+	LLMConfig      *LLMConfig
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
@@ -220,6 +221,9 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	if newMaxSignal.Empty() {
 		return
+	}
+	if fuzzer.Config.LLMConfig != nil {
+		fuzzer.Config.LLMConfig.lastNewCoverageTime = time.Now()
 	}
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
 		return
@@ -473,4 +477,24 @@ func DefaultExecOpts(cfg *mgrconfig.Config, features flatrpc.Feature, debug bool
 		ExecFlags:  exec,
 		SandboxArg: cfg.SandboxArg,
 	}
+}
+
+// LLMConfig 包含与LLM API相关的配置选项
+type LLMConfig struct {
+	// Enabled 表示是否启用LLM API
+	Enabled bool
+	// APIURL 是LLM API的URL
+	APIURL string
+	// StallThreshold 表示在考虑使用LLM API之前需要的执行次数
+	// 当执行次数超过此阈值时，可能会启用LLM API来解决潜在的卡顿问题
+	StallThreshold int
+	// UsageFrequency 控制使用LLM API的频率百分比
+	// 例如，值为10表示有10%的机会在满足条件时使用LLM API
+	UsageFrequency int
+	// UseOpenAIFormat 表示是否使用OpenAI标准格式进行API调用
+	UseOpenAIFormat bool
+	// Last time new coverage was found
+	lastNewCoverageTime time.Time
+	// Counter for iterations without new coverage
+	stallCounter int
 }
