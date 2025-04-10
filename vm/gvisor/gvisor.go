@@ -286,7 +286,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return filepath.Join("/", fname), nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	args := []string{"exec", "-user=0:0"}
 	for _, c := range sandboxCaps {

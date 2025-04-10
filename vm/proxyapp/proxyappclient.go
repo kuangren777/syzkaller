@@ -481,6 +481,7 @@ func (inst *instance) Run(
 	timeout time.Duration,
 	stop <-chan bool,
 	command string,
+	env ...[]string,
 ) (<-chan []byte, <-chan error, error) {
 	merger, wPipes := buildMerger("stdout", "stderr", "console")
 	receivedStdoutChunks := wPipes[0]

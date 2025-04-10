@@ -260,6 +260,9 @@ type OutputSize int
 // An early notification that the command has finished / VM crashed.
 type EarlyFinishCb func()
 
+// SetEnv represents environment variables to be passed to the command
+type SetEnv []string
+
 // Run runs cmd inside of the VM (think of ssh cmd) and monitors command execution
 // and the kernel console output. It detects kernel oopses in output, lost connections, hangs, etc.
 // Returns command+kernel output and a non-symbolized crash report (nil if no error happens).
@@ -267,12 +270,14 @@ type EarlyFinishCb func()
 //   - StopContext: the context to be used to prematurely stop the command
 //   - ExitCondition: says which exit modes should be considered as errors/OK
 //   - OutputSize: how much output to keep/return
+//   - SetEnv: environment variables to pass to the command
 func (inst *Instance) Run(timeout time.Duration, reporter *report.Reporter, command string, opts ...any) (
 	[]byte, *report.Report, error) {
 	exit := ExitNormal
 	var stop <-chan bool
 	var injected <-chan bool
 	var finished func()
+	var env []string
 	outputSize := beforeContextDefault
 	for _, o := range opts {
 		switch opt := o.(type) {
@@ -291,11 +296,17 @@ func (inst *Instance) Run(timeout time.Duration, reporter *report.Reporter, comm
 			injected = (<-chan bool)(opt)
 		case EarlyFinishCb:
 			finished = opt
+		case SetEnv:
+			env = []string(opt)
 		default:
 			panic(fmt.Sprintf("unknown option %#v", opt))
 		}
 	}
-	outc, errc, err := inst.impl.Run(timeout, stop, command)
+	var envSlice [][]string
+	if len(env) > 0 {
+		envSlice = append(envSlice, env)
+	}
+	outc, errc, err := inst.impl.Run(timeout, stop, command, envSlice...)
 	if err != nil {
 		return nil, nil, err
 	}

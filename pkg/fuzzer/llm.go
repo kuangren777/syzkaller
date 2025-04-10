@@ -5,6 +5,7 @@ package fuzzer
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -160,6 +161,10 @@ func (fuzzer *Fuzzer) UseLLMForMutation(p *prog.Prog) (*prog.Prog, error) {
 
 // callLLMAPI 调用LLM API获取变异建议
 func (fuzzer *Fuzzer) callLLMAPI(instruction, input string) (*LLMMutation, error) {
+	if fuzzer.Config == nil {
+		return nil, fmt.Errorf("fuzzer Config is nil")
+	}
+
 	if fuzzer.Config.LLMConfig == nil || !fuzzer.Config.LLMConfig.Enabled {
 		return nil, fmt.Errorf("LLM API not enabled")
 	}
@@ -173,7 +178,16 @@ func (fuzzer *Fuzzer) callLLMAPI(instruction, input string) (*LLMMutation, error
 	var resp *http.Response
 	var err error
 
-	if fuzzer.Config.LLMConfig.UseOpenAIFormat {
+	// 记录完整配置以便调试
+	fuzzer.Logf(1, "LLM API调用: URL=%s, UseOpenAIFormat=%v, StallThreshold=%d, UsageFrequency=%d",
+		apiURL, fuzzer.Config.LLMConfig.UseOpenAIFormat,
+		fuzzer.Config.LLMConfig.StallThreshold,
+		fuzzer.Config.LLMConfig.UsageFrequency)
+
+	// 保存一份配置副本，防止并发修改
+	useOpenAIFormat := fuzzer.Config.LLMConfig.UseOpenAIFormat
+
+	if useOpenAIFormat {
 		// 使用OpenAI标准格式
 		type OpenAIMessage struct {
 			Role    string `json:"role"`
@@ -231,9 +245,17 @@ func (fuzzer *Fuzzer) callLLMAPI(instruction, input string) (*LLMMutation, error
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// 确保配置在解析响应前仍然有效
+	if fuzzer.Config == nil || fuzzer.Config.LLMConfig == nil {
+		return nil, fmt.Errorf("LLM config became nil during API call")
+	}
+
+	// 记录原始响应以便调试
+	fuzzer.Logf(3, "LLM API响应: %s", string(body))
+
 	// 解析响应
 	var output string
-	if fuzzer.Config.LLMConfig.UseOpenAIFormat {
+	if useOpenAIFormat {
 		// 解析OpenAI响应格式
 		type OpenAIResponse struct {
 			Choices []struct {
@@ -249,7 +271,14 @@ func (fuzzer *Fuzzer) callLLMAPI(instruction, input string) (*LLMMutation, error
 		if len(openaiResp.Choices) == 0 {
 			return nil, fmt.Errorf("no choices in OpenAI response: %s", string(body))
 		}
-		output = openaiResp.Choices[0].Message.Content
+
+		// 防止Choices[0].Message.Content为空
+		if len(openaiResp.Choices) > 0 {
+			output = openaiResp.Choices[0].Message.Content
+			fuzzer.Logf(2, "解析的LLM输出: %s", output)
+		} else {
+			return nil, fmt.Errorf("empty choices in OpenAI response")
+		}
 	} else {
 		// 解析原来的响应格式
 		var llmResp LLMResponse
@@ -257,10 +286,26 @@ func (fuzzer *Fuzzer) callLLMAPI(instruction, input string) (*LLMMutation, error
 			return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 		}
 		output = llmResp.Output
+		fuzzer.Logf(2, "解析的LLM输出: %s", output)
+	}
+
+	if output == "" {
+		return nil, fmt.Errorf("empty output from LLM API")
 	}
 
 	// 解析LLM输出为变异操作
-	return parseLLMOutput(output)
+	mutation, err := parseLLMOutput(output)
+	if err != nil {
+		fuzzer.Logf(1, "无法解析LLM输出为变异操作: %v", err)
+		return nil, err
+	}
+
+	if mutation == nil {
+		return nil, fmt.Errorf("parsed mutation is nil")
+	}
+
+	fuzzer.Logf(1, "成功解析变异操作: 类型=%s, 位置=%d", mutation.Operation, mutation.Position)
+	return mutation, nil
 }
 
 // formatProgCalls 将程序格式化为系统调用序列字符串
@@ -274,86 +319,285 @@ func formatProgCalls(p *prog.Prog) string {
 
 // parseLLMOutput 解析LLM输出为变异操作
 func parseLLMOutput(output string) (*LLMMutation, error) {
-	// 查找尖括号中的内容
+	fmt.Printf("【LLM解析调试】开始解析输出: %s\n", output)
+
+	if output == "" {
+		fmt.Printf("【LLM解析调试】输出为空\n")
+		return nil, fmt.Errorf("empty output to parse")
+	}
+
+	// 使用正则表达式匹配，这是最可靠的方法
+	fmt.Printf("【LLM解析调试】尝试正则表达式匹配\n")
+
+	// 尝试ADD匹配
+	if match := addRegex.FindStringSubmatch(output); match != nil && len(match) >= 3 {
+		fmt.Printf("【LLM解析调试】匹配到ADD模式: pos=%s, call=%s\n", match[1], match[2])
+		pos, err := strconv.Atoi(match[1])
+		if err != nil {
+			fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+			return nil, fmt.Errorf("invalid position in ADD operation: %s", match[1])
+		}
+		return &LLMMutation{
+			Operation: LLMOpAdd,
+			Position:  pos,
+			NewCall:   match[2],
+		}, nil
+	}
+
+	// 尝试DELETE匹配
+	if match := deleteRegex.FindStringSubmatch(output); match != nil && len(match) >= 3 {
+		fmt.Printf("【LLM解析调试】匹配到DELETE模式: pos=%s, call=%s\n", match[1], match[2])
+		pos, err := strconv.Atoi(match[1])
+		if err != nil {
+			fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+			return nil, fmt.Errorf("invalid position in DELETE operation: %s", match[1])
+		}
+		return &LLMMutation{
+			Operation: LLMOpDelete,
+			Position:  pos,
+			OldCall:   match[2],
+		}, nil
+	}
+
+	// 尝试REPLACE匹配
+	if match := replaceRegex.FindStringSubmatch(output); match != nil && len(match) >= 4 {
+		fmt.Printf("【LLM解析调试】匹配到REPLACE模式: pos=%s, old_call=%s, new_call=%s\n",
+			match[1], match[2], match[3])
+		pos, err := strconv.Atoi(match[1])
+		if err != nil {
+			fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+			return nil, fmt.Errorf("invalid position in REPLACE operation: %s", match[1])
+		}
+		return &LLMMutation{
+			Operation: LLMOpReplace,
+			Position:  pos,
+			OldCall:   match[2],
+			NewCall:   match[3],
+		}, nil
+	}
+
+	fmt.Printf("【LLM解析调试】正则表达式匹配失败，尝试尖括号格式解析\n")
+
+	// 尝试使用尖括号格式解析
 	startIdx := strings.Index(output, "<")
 	endIdx := strings.Index(output, ">")
 
-	if startIdx == -1 || endIdx == -1 || startIdx >= endIdx {
-		return nil, fmt.Errorf("invalid LLM output format: %s", output)
-	}
+	if startIdx != -1 && endIdx != -1 && startIdx < endIdx {
+		fmt.Printf("【LLM解析调试】找到尖括号内容: %s\n", output[startIdx:endIdx+1])
 
-	// 提取操作内容
-	opContent := output[startIdx+1 : endIdx]
-	parts := strings.Split(opContent, " ")
+		// 提取操作内容
+		opContent := output[startIdx+1 : endIdx]
+		fmt.Printf("【LLM解析调试】提取的操作内容: %s\n", opContent)
 
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid operation format: %s", opContent)
-	}
+		parts := strings.Split(opContent, " ")
+		fmt.Printf("【LLM解析调试】分割后的部分: %v\n", parts)
 
-	mutation := &LLMMutation{}
-
-	// 解析操作类型
-	opType := strings.ToUpper(parts[0])
-	switch opType {
-	case LLMOpAdd:
-		// 格式: ADD pos='N' call='syscall_name'
-		mutation.Operation = LLMOpAdd
-		for i := 1; i < len(parts); i++ {
-			if strings.HasPrefix(parts[i], "pos=") {
-				posStr := strings.Trim(parts[i][4:], "'")
-				pos, err := parsePosition(posStr)
-				if err != nil {
-					return nil, err
-				}
-				mutation.Position = pos
-			} else if strings.HasPrefix(parts[i], "call=") {
-				callName := strings.Trim(parts[i][5:], "'")
-				mutation.NewCall = callName
-			}
+		if len(parts) < 2 {
+			fmt.Printf("【LLM解析调试】部分数量不足: %d\n", len(parts))
+			return nil, fmt.Errorf("invalid operation format: %s", opContent)
 		}
 
-	case LLMOpDelete:
-		// 格式: DELETE pos='N' call='syscall_name'
-		mutation.Operation = LLMOpDelete
-		for i := 1; i < len(parts); i++ {
-			if strings.HasPrefix(parts[i], "pos=") {
-				posStr := strings.Trim(parts[i][4:], "'")
-				pos, err := parsePosition(posStr)
-				if err != nil {
-					return nil, err
+		mutation := &LLMMutation{}
+
+		// 解析操作类型
+		opType := strings.ToUpper(parts[0])
+		fmt.Printf("【LLM解析调试】操作类型: %s\n", opType)
+
+		switch opType {
+		case LLMOpAdd:
+			// 格式: ADD pos='N' call='syscall_name'
+			fmt.Printf("【LLM解析调试】识别ADD操作\n")
+			mutation.Operation = LLMOpAdd
+			for i := 1; i < len(parts); i++ {
+				fmt.Printf("【LLM解析调试】解析参数: %s\n", parts[i])
+				if strings.HasPrefix(parts[i], "pos=") {
+					posStr := strings.Trim(parts[i][4:], "'")
+					fmt.Printf("【LLM解析调试】提取位置: %s\n", posStr)
+					pos, err := parsePosition(posStr)
+					if err != nil {
+						fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+						return nil, err
+					}
+					mutation.Position = pos
+				} else if strings.HasPrefix(parts[i], "call=") {
+					callName := strings.Trim(parts[i][5:], "'")
+					fmt.Printf("【LLM解析调试】提取调用名称: %s\n", callName)
+					mutation.NewCall = callName
 				}
-				mutation.Position = pos
-			} else if strings.HasPrefix(parts[i], "call=") {
-				callName := strings.Trim(parts[i][5:], "'")
-				mutation.OldCall = callName
 			}
+
+		case LLMOpDelete:
+			// 格式: DELETE pos='N' call='syscall_name'
+			fmt.Printf("【LLM解析调试】识别DELETE操作\n")
+			mutation.Operation = LLMOpDelete
+			for i := 1; i < len(parts); i++ {
+				fmt.Printf("【LLM解析调试】解析参数: %s\n", parts[i])
+				if strings.HasPrefix(parts[i], "pos=") {
+					posStr := strings.Trim(parts[i][4:], "'")
+					fmt.Printf("【LLM解析调试】提取位置: %s\n", posStr)
+					pos, err := parsePosition(posStr)
+					if err != nil {
+						fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+						return nil, err
+					}
+					mutation.Position = pos
+				} else if strings.HasPrefix(parts[i], "call=") {
+					callName := strings.Trim(parts[i][5:], "'")
+					fmt.Printf("【LLM解析调试】提取调用名称: %s\n", callName)
+					mutation.OldCall = callName
+				}
+			}
+
+		case LLMOpReplace:
+			// 格式: REPLACE pos='N' old_call='syscall_name' new_call='syscall_name'
+			fmt.Printf("【LLM解析调试】识别REPLACE操作\n")
+			mutation.Operation = LLMOpReplace
+			for i := 1; i < len(parts); i++ {
+				fmt.Printf("【LLM解析调试】解析参数: %s\n", parts[i])
+				if strings.HasPrefix(parts[i], "pos=") {
+					posStr := strings.Trim(parts[i][4:], "'")
+					fmt.Printf("【LLM解析调试】提取位置: %s\n", posStr)
+					pos, err := parsePosition(posStr)
+					if err != nil {
+						fmt.Printf("【LLM解析调试】位置解析失败: %v\n", err)
+						return nil, err
+					}
+					mutation.Position = pos
+				} else if strings.HasPrefix(parts[i], "old_call=") {
+					callName := strings.Trim(parts[i][9:], "'")
+					fmt.Printf("【LLM解析调试】提取旧调用名称: %s\n", callName)
+					mutation.OldCall = callName
+				} else if strings.HasPrefix(parts[i], "new_call=") {
+					callName := strings.Trim(parts[i][9:], "'")
+					fmt.Printf("【LLM解析调试】提取新调用名称: %s\n", callName)
+					mutation.NewCall = callName
+				}
+			}
+
+		default:
+			fmt.Printf("【LLM解析调试】未知操作类型: %s\n", opType)
+			return nil, fmt.Errorf("unknown operation type: %s", opType)
 		}
 
-	case LLMOpReplace:
-		// 格式: REPLACE pos='N' old_call='syscall_name' new_call='syscall_name'
-		mutation.Operation = LLMOpReplace
-		for i := 1; i < len(parts); i++ {
-			if strings.HasPrefix(parts[i], "pos=") {
-				posStr := strings.Trim(parts[i][4:], "'")
-				pos, err := parsePosition(posStr)
-				if err != nil {
-					return nil, err
-				}
-				mutation.Position = pos
-			} else if strings.HasPrefix(parts[i], "old_call=") {
-				callName := strings.Trim(parts[i][9:], "'")
-				mutation.OldCall = callName
-			} else if strings.HasPrefix(parts[i], "new_call=") {
-				callName := strings.Trim(parts[i][9:], "'")
-				mutation.NewCall = callName
-			}
+		// 验证操作的完整性
+		fmt.Printf("【LLM解析调试】验证操作完整性: Operation=%s, Position=%d, OldCall=%s, NewCall=%s\n",
+			mutation.Operation, mutation.Position, mutation.OldCall, mutation.NewCall)
+
+		if mutation.Operation == LLMOpAdd && mutation.NewCall == "" {
+			fmt.Printf("【LLM解析调试】ADD操作缺少调用名称\n")
+			return nil, fmt.Errorf("ADD operation missing call name")
+		} else if mutation.Operation == LLMOpDelete && mutation.Position < 0 {
+			fmt.Printf("【LLM解析调试】DELETE操作缺少有效位置\n")
+			return nil, fmt.Errorf("DELETE operation missing valid position")
+		} else if mutation.Operation == LLMOpReplace && (mutation.NewCall == "" || mutation.Position < 0) {
+			fmt.Printf("【LLM解析调试】REPLACE操作缺少必要字段\n")
+			return nil, fmt.Errorf("REPLACE operation missing required fields")
 		}
 
-	default:
-		return nil, fmt.Errorf("unknown operation type: %s", opType)
+		fmt.Printf("【LLM解析调试】尖括号格式解析成功\n")
+		return mutation, nil
 	}
 
-	return mutation, nil
+	// 如果上述方法都失败，尝试直接从文本中提取关键信息
+	fmt.Printf("【LLM解析调试】尖括号格式解析失败，尝试从文本提取关键信息\n")
+
+	lowOutput := strings.ToLower(output)
+
+	// 尝试识别ADD操作
+	if strings.Contains(lowOutput, "add") && (strings.Contains(lowOutput, "position") || strings.Contains(lowOutput, "pos")) {
+		fmt.Printf("【LLM解析调试】文本中可能包含ADD操作\n")
+
+		// 尝试找出位置
+		posMatch := regexp.MustCompile(`(?:position|pos)(?:ition)?[:\s=]*(\d+)`).FindStringSubmatch(lowOutput)
+		var pos int
+		if posMatch != nil && len(posMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到位置匹配: %s\n", posMatch[1])
+			pos, _ = strconv.Atoi(posMatch[1])
+		} else {
+			fmt.Printf("【LLM解析调试】未找到位置\n")
+		}
+
+		// 尝试找出调用名称
+		callMatch := regexp.MustCompile(`(?:call|syscall|system call)[:\s=]*['"]?([a-zA-Z0-9_$]+)['"]?`).FindStringSubmatch(lowOutput)
+		if callMatch != nil && len(callMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到调用名称匹配: %s\n", callMatch[1])
+			return &LLMMutation{
+				Operation: LLMOpAdd,
+				Position:  pos,
+				NewCall:   callMatch[1],
+			}, nil
+		} else {
+			fmt.Printf("【LLM解析调试】未找到调用名称\n")
+		}
+	}
+
+	// 尝试识别DELETE操作
+	if strings.Contains(lowOutput, "delete") || strings.Contains(lowOutput, "remove") {
+		fmt.Printf("【LLM解析调试】文本中可能包含DELETE操作\n")
+
+		posMatch := regexp.MustCompile(`(?:position|pos)(?:ition)?[:\s=]*(\d+)`).FindStringSubmatch(lowOutput)
+		var pos int
+		if posMatch != nil && len(posMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到位置匹配: %s\n", posMatch[1])
+			pos, _ = strconv.Atoi(posMatch[1])
+		} else {
+			fmt.Printf("【LLM解析调试】未找到位置\n")
+		}
+
+		// 尝试找出调用名称
+		callMatch := regexp.MustCompile(`(?:call|syscall|system call)[:\s=]*['"]?([a-zA-Z0-9_$]+)['"]?`).FindStringSubmatch(lowOutput)
+		if callMatch != nil && len(callMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到调用名称匹配: %s\n", callMatch[1])
+			return &LLMMutation{
+				Operation: LLMOpDelete,
+				Position:  pos,
+				OldCall:   callMatch[1],
+			}, nil
+		} else {
+			fmt.Printf("【LLM解析调试】未找到调用名称\n")
+		}
+	}
+
+	// 尝试识别REPLACE操作
+	if strings.Contains(lowOutput, "replace") || strings.Contains(lowOutput, "change") {
+		fmt.Printf("【LLM解析调试】文本中可能包含REPLACE操作\n")
+
+		posMatch := regexp.MustCompile(`(?:position|pos)(?:ition)?[:\s=]*(\d+)`).FindStringSubmatch(lowOutput)
+		var pos int
+		if posMatch != nil && len(posMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到位置匹配: %s\n", posMatch[1])
+			pos, _ = strconv.Atoi(posMatch[1])
+		} else {
+			fmt.Printf("【LLM解析调试】未找到位置\n")
+		}
+
+		// 尝试找出旧调用名称
+		oldCallMatch := regexp.MustCompile(`(?:old|original|replace)(?:_call)?[:\s=]*['"]?([a-zA-Z0-9_$]+)['"]?`).FindStringSubmatch(lowOutput)
+		var oldCall string
+		if oldCallMatch != nil && len(oldCallMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到旧调用名称匹配: %s\n", oldCallMatch[1])
+			oldCall = oldCallMatch[1]
+		} else {
+			fmt.Printf("【LLM解析调试】未找到旧调用名称\n")
+		}
+
+		// 尝试找出新调用名称
+		newCallMatch := regexp.MustCompile(`(?:new|with|to)(?:_call)?[:\s=]*['"]?([a-zA-Z0-9_$]+)['"]?`).FindStringSubmatch(lowOutput)
+		if newCallMatch != nil && len(newCallMatch) > 1 {
+			fmt.Printf("【LLM解析调试】找到新调用名称匹配: %s\n", newCallMatch[1])
+			return &LLMMutation{
+				Operation: LLMOpReplace,
+				Position:  pos,
+				OldCall:   oldCall,
+				NewCall:   newCallMatch[1],
+			}, nil
+		} else {
+			fmt.Printf("【LLM解析调试】未找到新调用名称\n")
+		}
+	}
+
+	fmt.Printf("【LLM解析调试】所有解析方法都失败\n")
+	return nil, fmt.Errorf("无法解析LLM输出: %s", output)
 }
 
 // parsePosition 解析位置字符串为整数
@@ -380,6 +624,9 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		return p, nil
 	}
 
+	fuzzer.Logf(0, "【调试】尝试应用变异: 操作=%s, 位置=%d, 旧调用=%s, 新调用=%s",
+		mutation.Operation, mutation.Position, mutation.OldCall, mutation.NewCall)
+
 	// 创建程序的副本
 	newProg := p.Clone()
 	callCount := len(newProg.Calls)
@@ -389,8 +636,13 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		if mutation.Operation == LLMOpAdd && mutation.Position == callCount {
 			// 允许在末尾添加
 		} else {
-			return nil, fmt.Errorf("invalid position: %d (call count: %d)", mutation.Position, callCount)
+			return nil, fmt.Errorf("无效的位置: %d (调用数量: %d)", mutation.Position, callCount)
 		}
+	}
+
+	originalCallName := ""
+	if mutation.Position < callCount {
+		originalCallName = newProg.Calls[mutation.Position].Meta.Name
 	}
 
 	switch mutation.Operation {
@@ -398,25 +650,31 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		// 找到对应的系统调用
 		syscall := fuzzer.findSyscallByName(mutation.NewCall)
 		if syscall == nil {
-			return nil, fmt.Errorf("syscall not found: %s", mutation.NewCall)
+			fuzzer.Logf(0, "【调试】找不到系统调用: %s", mutation.NewCall)
+			return nil, fmt.Errorf("找不到系统调用: %s", mutation.NewCall)
 		}
+
+		fuzzer.Logf(0, "【调试】成功找到系统调用: %s", syscall.Name)
 
 		// 创建新的系统调用
 		call := prog.MakeCall(syscall, nil)
 		if call == nil {
-			return nil, fmt.Errorf("failed to create call: %s", mutation.NewCall)
+			return nil, fmt.Errorf("无法创建调用: %s", mutation.NewCall)
 		}
 
 		// 插入系统调用
 		if mutation.Position >= callCount {
 			newProg.Calls = append(newProg.Calls, call)
+			fuzzer.Logf(0, "【调试】已将调用 %s 添加到末尾", syscall.Name)
 		} else {
 			newProg.Calls = append(newProg.Calls[:mutation.Position], append([]*prog.Call{call}, newProg.Calls[mutation.Position:]...)...)
+			fuzzer.Logf(0, "【调试】已将调用 %s 插入到位置 %d", syscall.Name, mutation.Position)
 		}
 
 	case LLMOpDelete:
 		// 删除系统调用
 		if mutation.Position < callCount {
+			fuzzer.Logf(0, "【调试】即将删除位置 %d 的调用: %s", mutation.Position, originalCallName)
 			newProg.RemoveCall(mutation.Position)
 		}
 
@@ -424,13 +682,17 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		// 找到对应的系统调用
 		syscall := fuzzer.findSyscallByName(mutation.NewCall)
 		if syscall == nil {
-			return nil, fmt.Errorf("syscall not found: %s", mutation.NewCall)
+			fuzzer.Logf(0, "【调试】找不到系统调用: %s", mutation.NewCall)
+			return nil, fmt.Errorf("找不到系统调用: %s", mutation.NewCall)
 		}
+
+		fuzzer.Logf(0, "【调试】成功找到系统调用: %s，将替换位置 %d 的调用 %s",
+			syscall.Name, mutation.Position, originalCallName)
 
 		// 创建新的系统调用
 		call := prog.MakeCall(syscall, nil)
 		if call == nil {
-			return nil, fmt.Errorf("failed to create call: %s", mutation.NewCall)
+			return nil, fmt.Errorf("无法创建调用: %s", mutation.NewCall)
 		}
 
 		// 替换系统调用
@@ -441,13 +703,23 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 
 	// 检查程序是否有有效调用
 	if len(newProg.Calls) == 0 {
-		return nil, fmt.Errorf("no valid calls after mutation")
+		return nil, fmt.Errorf("变异后无有效调用")
 	}
 
 	// 尝试序列化程序，确保它是有效的
 	serialized := newProg.Serialize()
 	if len(serialized) == 0 {
-		return nil, fmt.Errorf("failed to serialize program after mutation")
+		return nil, fmt.Errorf("变异后程序无法序列化")
+	}
+
+	// 校验序列化后的程序是否与原始程序不同
+	originalHash := fmt.Sprintf("%x", sha1.Sum(p.Serialize()))
+	newHash := fmt.Sprintf("%x", sha1.Sum(serialized))
+
+	if originalHash == newHash {
+		fuzzer.Logf(0, "【调试】警告：变异后程序的哈希值与原始程序相同: %s", newHash)
+	} else {
+		fuzzer.Logf(0, "【调试】变异成功，程序哈希值已改变: %s -> %s", originalHash, newHash)
 	}
 
 	return newProg, nil
@@ -455,10 +727,54 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 
 // findSyscallByName 根据名称查找系统调用
 func (fuzzer *Fuzzer) findSyscallByName(name string) *prog.Syscall {
+	// 先尝试精确匹配
+	for _, call := range fuzzer.target.Syscalls {
+		if call.Name == name {
+			return call
+		}
+	}
+
+	// 如果精确匹配失败，尝试前缀匹配
 	for _, call := range fuzzer.target.Syscalls {
 		if strings.HasPrefix(call.Name, name) {
 			return call
 		}
 	}
+
+	// 如果前缀匹配失败，尝试包含匹配
+	for _, call := range fuzzer.target.Syscalls {
+		if strings.Contains(call.Name, name) {
+			return call
+		}
+	}
+
+	// 处理一些特殊情况
+	if name == "clone" {
+		// 尝试查找相关的克隆调用
+		for _, call := range fuzzer.target.Syscalls {
+			if strings.Contains(call.Name, "clone") {
+				return call
+			}
+		}
+	} else if name == "mount" || strings.HasPrefix(name, "mount$") {
+		// 尝试查找任何挂载相关调用
+		for _, call := range fuzzer.target.Syscalls {
+			if strings.Contains(call.Name, "mount") {
+				return call
+			}
+		}
+	} else if strings.Contains(name, "$") {
+		// 处理带有$分隔符的调用，尝试匹配主调用名
+		mainName := strings.Split(name, "$")[0]
+		for _, call := range fuzzer.target.Syscalls {
+			if strings.HasPrefix(call.Name, mainName) {
+				return call
+			}
+		}
+	}
+
+	// 记录未找到的系统调用名称以便调试
+	fuzzer.Logf(0, "【调试】未能找到系统调用: %s", name)
+
 	return nil
 }

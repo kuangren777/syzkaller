@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -293,6 +294,11 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		}
 	}
 
+	// 保存系统调用信息
+	if err := mgr.saveSyscallInfo(); err != nil {
+		log.Errorf("保存系统调用信息失败: %v", err)
+	}
+
 	if *flagDebug {
 		mgr.cfg.Procs = 1
 	}
@@ -389,11 +395,6 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
 	mgr.pool.Loop(ctx)
-
-	// 保存系统调用信息
-	if err := mgr.saveSyscallInfo(); err != nil {
-		log.Errorf("保存系统调用信息失败: %v", err)
-	}
 }
 
 // Exit successfully in special operation modes.
@@ -639,6 +640,14 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
 		}
 		log.Logf(0, "LLM API 已启用: URL=%v, 使用OpenAI格式, 阈值=%v, 频率=%v%%",
 			llmConfig.APIURL, llmConfig.StallThreshold, llmConfig.UsageFrequency)
+
+		// 将LLMConfig添加到当前运行的fuzzer实例中
+		mgr.mu.Lock()
+		if fuzzerObj := mgr.fuzzer.Load(); fuzzerObj != nil {
+			fuzzerObj.Config.LLMConfig = llmConfig
+			log.Logf(0, "已将LLMConfig添加到当前运行的fuzzer实例")
+		}
+		mgr.mu.Unlock()
 	}
 
 	// 创建一个done通道，当函数返回时关闭
@@ -708,6 +717,39 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, inj
 		}
 	}
 
+	// 创建LLM配置对象，但不通过命令行传递
+	var env []string
+	if mgr.cfg.Experimental.LLMAPIEnabled {
+		apiURL := mgr.cfg.Experimental.LLMAPIURL
+		if apiURL == "" {
+			apiURL = "http://100.64.88.112:5231"
+		}
+		llmConfig := &fuzzer.LLMConfig{
+			Enabled:         true,
+			APIURL:          apiURL,
+			StallThreshold:  mgr.cfg.Experimental.LLMStallThreshold,
+			UsageFrequency:  mgr.cfg.Experimental.LLMUsageFrequency,
+			UseOpenAIFormat: true,
+		}
+		// 设置默认值
+		if llmConfig.StallThreshold == 0 {
+			llmConfig.StallThreshold = 1000
+		}
+		if llmConfig.UsageFrequency == 0 {
+			llmConfig.UsageFrequency = 10
+		}
+
+		// 通过环境变量传递LLM配置
+		env = append(env, fmt.Sprintf("SYZ_LLM_ENABLED=1"))
+		env = append(env, fmt.Sprintf("SYZ_LLM_API_URL=%s", llmConfig.APIURL))
+		env = append(env, fmt.Sprintf("SYZ_LLM_STALL_THRESHOLD=%d", llmConfig.StallThreshold))
+		env = append(env, fmt.Sprintf("SYZ_LLM_USAGE_FREQUENCY=%d", llmConfig.UsageFrequency))
+		env = append(env, fmt.Sprintf("SYZ_LLM_USE_OPENAI_FORMAT=1"))
+
+		log.Logf(0, "在VM %v中启用LLM配置: URL=%v, 使用OpenAI格式, 阈值=%v, 频率=%v%%",
+			inst.Index(), llmConfig.APIURL, llmConfig.StallThreshold, llmConfig.UsageFrequency)
+	}
+
 	// Run the fuzzer binary.
 	start := time.Now()
 
@@ -715,11 +757,24 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, inj
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse manager's address")
 	}
+
+	// 恢复原始命令行格式
 	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
-	_, rep, err := inst.Run(mgr.cfg.Timeouts.VMRunningTime, mgr.reporter, cmd,
-		vm.ExitTimeout, vm.StopContext(ctx), vm.InjectExecuting(injectExec),
+	log.Logf(1, "运行命令: %s (添加环境变量: %v)", cmd, env)
+
+	// 使用vm.SetEnv将环境变量传递
+	opts := []any{
+		vm.ExitTimeout,
+		vm.StopContext(ctx),
+		vm.InjectExecuting(injectExec),
 		finishCb,
-	)
+	}
+	if len(env) > 0 {
+		opts = append(opts, vm.SetEnv(env))
+	}
+
+	// 传递环境变量
+	_, rep, err := inst.Run(mgr.cfg.Timeouts.VMRunningTime, mgr.reporter, cmd, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to run fuzzer: %w", err)
 	}
@@ -1191,6 +1246,33 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 	mgr.setPhaseLocked(phaseLoadedCorpus)
 	opts := fuzzer.DefaultExecOpts(mgr.cfg, features, *flagDebug)
 
+	// 创建LLMConfig对象
+	var llmConfig *fuzzer.LLMConfig
+	if mgr.cfg.Experimental.LLMAPIEnabled {
+		apiURL := mgr.cfg.Experimental.LLMAPIURL
+		if apiURL == "" {
+			apiURL = "http://100.64.88.112:5231"
+		}
+		llmConfig = &fuzzer.LLMConfig{
+			Enabled:         true,
+			APIURL:          apiURL,
+			StallThreshold:  mgr.cfg.Experimental.LLMStallThreshold,
+			UsageFrequency:  mgr.cfg.Experimental.LLMUsageFrequency,
+			UseOpenAIFormat: true,
+		}
+		// 设置默认值
+		if llmConfig.StallThreshold == 0 {
+			llmConfig.StallThreshold = 1000
+		}
+		if llmConfig.UsageFrequency == 0 {
+			llmConfig.UsageFrequency = 10
+		}
+		log.Logf(0, "创建LLMConfig: URL=%v, 使用OpenAI格式=true, 阈值=%v, 频率=%v%%",
+			llmConfig.APIURL, llmConfig.StallThreshold, llmConfig.UsageFrequency)
+	} else {
+		log.Logf(0, "LLM API未启用，不创建LLMConfig")
+	}
+
 	if mgr.mode == ModeFuzzing || mgr.mode == ModeCorpusTriage {
 		corpusUpdates := make(chan corpus.NewItemEvent, 128)
 		mgr.corpus = corpus.NewFocusedCorpus(context.Background(),
@@ -1198,7 +1280,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 		mgr.http.Corpus.Store(mgr.corpus)
 
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-		fuzzerObj := fuzzer.NewFuzzer(context.Background(), &fuzzer.Config{
+		fuzzerConfig := &fuzzer.Config{
 			Corpus:         mgr.corpus,
 			Snapshot:       mgr.cfg.Snapshot,
 			Coverage:       mgr.cfg.Cover,
@@ -1208,6 +1290,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			EnabledCalls:   enabledSyscalls,
 			NoMutateCalls:  mgr.cfg.NoMutateCalls,
 			FetchRawCover:  mgr.cfg.RawCover,
+			LLMConfig:      llmConfig, // 设置LLMConfig
 			Logf: func(level int, msg string, args ...interface{}) {
 				if level != 0 {
 					return
@@ -1219,7 +1302,12 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				defer mgr.mu.Unlock()
 				return !mgr.saturatedCalls[call]
 			},
-		}, rnd, mgr.target)
+		}
+
+		// 记录创建的配置情况
+		log.Logf(0, "创建fuzzerConfig: LLMConfig=%v", fuzzerConfig.LLMConfig != nil)
+
+		fuzzerObj := fuzzer.NewFuzzer(context.Background(), fuzzerConfig, rnd, mgr.target)
 		fuzzerObj.AddCandidates(candidates)
 		mgr.fuzzer.Store(fuzzerObj)
 		mgr.http.Fuzzer.Store(fuzzerObj)
@@ -1554,6 +1642,11 @@ func publicWebAddr(addr string) string {
 }
 
 func (mgr *Manager) saveSyscallInfo() error {
+	// 检查target是否为nil
+	if mgr == nil || mgr.target == nil {
+		return fmt.Errorf("target未初始化")
+	}
+
 	// 获取系统调用信息
 	syscalls := mgr.target.Syscalls
 	if len(syscalls) == 0 {
@@ -1572,22 +1665,42 @@ func (mgr *Manager) saveSyscallInfo() error {
 
 	syscallInfos := make([]SyscallInfo, 0, len(syscalls))
 	for _, syscall := range syscalls {
+		// 检查syscall是否为nil
+		if syscall == nil {
+			continue
+		}
+
 		args := make([]string, 0, len(syscall.Args))
 		for _, arg := range syscall.Args {
-			args = append(args, fmt.Sprintf("%s %s", arg.Type.Name(), arg.Name))
+			if arg.Type != nil {
+				args = append(args, fmt.Sprintf("%s %s", arg.Type.Name(), arg.Name))
+			} else {
+				args = append(args, fmt.Sprintf("unknown %s", arg.Name))
+			}
 		}
 
 		// 从SyscallAttrs中提取属性
 		attrs := extractSyscallAttrs(syscall.Attrs)
+
+		// 检查syscall.Ret是否为nil
+		retTypeName := "void"
+		if syscall.Ret != nil {
+			retTypeName = syscall.Ret.Name()
+		}
 
 		info := SyscallInfo{
 			Name:       syscall.Name,
 			Attrs:      attrs,
 			Number:     syscall.NR,
 			Args:       args,
-			ReturnType: syscall.Ret.Name(),
+			ReturnType: retTypeName,
 		}
 		syscallInfos = append(syscallInfos, info)
+	}
+
+	// 检查Workdir是否存在
+	if mgr.cfg == nil || mgr.cfg.Workdir == "" {
+		return fmt.Errorf("工作目录未设置")
 	}
 
 	// 保存到文件
@@ -1691,66 +1804,160 @@ func (le *LLMEnhancer) enhanceWithLLM() {
 	le.mgr.mu.Unlock()
 
 	if fuzzerObj == nil {
+		log.Errorf("【调试】无法获取fuzzer实例，跳过LLM增强")
 		return
 	}
 
-	// 检查LLM配置
-	if fuzzerObj.Config.LLMConfig == nil || !fuzzerObj.Config.LLMConfig.Enabled {
+	// 检查fuzzer配置
+	if fuzzerObj.Config == nil {
+		log.Errorf("【调试】fuzzer配置为空，跳过LLM增强")
 		return
 	}
 
-	log.Logf(0, "开始从高覆盖率程序中选择候选程序进行LLM增强...")
+	if fuzzerObj.Config.LLMConfig == nil {
+		log.Errorf("【调试】LLM配置为空，跳过LLM增强")
+		return
+	}
 
-	// 获取corpus中的程序并按覆盖率排序
+	if !fuzzerObj.Config.LLMConfig.Enabled {
+		log.Errorf("【调试】LLM功能未启用，跳过LLM增强")
+		return
+	}
+
+	apiURL := fuzzerObj.Config.LLMConfig.APIURL
+	log.Logf(0, "【调试】开始LLM增强，API URL: %s", apiURL)
+	log.Logf(0, "【调试】LLM配置: UseOpenAIFormat=%v, StallThreshold=%d, UsageFrequency=%d",
+		fuzzerObj.Config.LLMConfig.UseOpenAIFormat,
+		fuzzerObj.Config.LLMConfig.StallThreshold,
+		fuzzerObj.Config.LLMConfig.UsageFrequency)
+
+	// 测试LLM API可用性
+	if err := testLLMAPIAvailability(apiURL); err != nil {
+		log.Errorf("【调试】LLM API不可用: %v", err)
+		return
+	}
+	log.Logf(0, "【调试】LLM API连接测试成功")
+
+	// 获取当前语料库中的所有程序
 	items := le.mgr.getMinimizedCorpus()
 	if len(items) == 0 {
-		log.Logf(0, "Corpus为空，无法进行LLM增强")
+		log.Logf(0, "【调试】语料库为空，跳过LLM增强")
 		return
 	}
+	log.Logf(0, "【调试】Corpus大小: %d", len(items))
 
-	// 按覆盖率排序
+	// 选择覆盖率较高的程序进行增强
+	// 按覆盖率信号数量排序
 	sort.Slice(items, func(i, j int) bool {
 		return len(items[i].Signal) > len(items[j].Signal)
 	})
 
-	// 取前10个或全部（如果不足10个）
+	// 取前N个程序
 	topN := 10
 	if len(items) < topN {
 		topN = len(items)
 	}
 
-	// 随机选择一个高覆盖率程序
+	// 随机选择一个程序
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	selectedIdx := rnd.Intn(topN)
-	selectedProg := items[selectedIdx].Prog
 
-	log.Logf(0, "从前%d个高覆盖率程序中选择了程序 #%d 进行LLM增强", topN, selectedIdx)
+	// 多尝试几次，以防某个程序变异失败
+	maxTries := 3
+	var enhancedProg *prog.Prog
+	var err error
+	var selectedProg *prog.Prog
+	var originalHash string
+	var enhancedHash string
+	var selectedIdx int
+	var startTime time.Time
+	var callDuration time.Duration
 
-	// 使用LLM增强程序
-	startTime := time.Now()
-	enhancedProg, err := fuzzerObj.UseLLMForMutation(selectedProg.Clone())
-	callDuration := time.Since(startTime)
+	for try := 0; try < maxTries; try++ {
+		selectedIdx = rnd.Intn(topN)
+		selectedProg = items[selectedIdx].Prog
 
-	if err != nil {
-		log.Errorf("LLM增强失败 (耗时: %v): %v", callDuration, err)
+		log.Logf(0, "【调试】尝试 #%d: 选择的程序 #%d, 覆盖率信号数: %d",
+			try+1, selectedIdx, len(items[selectedIdx].Signal))
+		log.Logf(0, "【调试】选择的程序内容: %s", selectedProg.String())
+
+		// 使用LLM增强程序
+		startTime = time.Now()
+
+		// 获取原始种子程序的哈希
+		originalSeed := selectedProg.Serialize()
+		originalHash = fmt.Sprintf("%x", sha1.Sum(originalSeed))
+		log.Logf(0, "【调试】原始程序哈希: %s", originalHash)
+
+		// 再次确认LLM配置存在
+		if fuzzerObj.Config == nil || fuzzerObj.Config.LLMConfig == nil {
+			log.Errorf("【调试】LLM配置在调用前变为nil，跳过LLM增强")
+			return
+		}
+
+		enhancedProg, err = fuzzerObj.UseLLMForMutation(selectedProg.Clone())
+		callDuration = time.Since(startTime)
+
+		if err != nil {
+			log.Errorf("【调试】LLM增强调用失败 (耗时: %v): %v", callDuration, err)
+			continue // 尝试下一个程序
+		}
+
+		if enhancedProg == nil {
+			log.Errorf("【调试】LLM返回了空程序 (耗时: %v)", callDuration)
+			continue // 尝试下一个程序
+		}
+
+		// 校验增强后的程序是否与原始程序相同
+		enhancedSeed := enhancedProg.Serialize()
+		enhancedHash = fmt.Sprintf("%x", sha1.Sum(enhancedSeed))
+		log.Logf(0, "【调试】增强后程序哈希: %s", enhancedHash)
+
+		if originalHash != enhancedHash {
+			// 找到有效的变异，跳出循环
+			log.Logf(0, "【调试】成功变异程序，哈希不同")
+			break
+		}
+
+		log.Errorf("【调试】LLM未对程序做出任何改变，哈希相同，尝试另一个程序")
+	}
+
+	// 如果所有尝试都失败，退出
+	if originalHash == enhancedHash || enhancedProg == nil {
+		log.Errorf("【调试】经过%d次尝试，无法生成有效变异", maxTries)
 		return
 	}
 
-	if enhancedProg != nil {
-		log.Logf(0, "成功使用LLM增强程序 (耗时: %v): %s", callDuration, enhancedProg.String())
-
-		// 添加增强后的程序到候选队列
-		candidates := []fuzzer.Candidate{
-			{
-				Prog:  enhancedProg,
-				Flags: 0,
-			},
+	// 检查增强后的程序与原始程序的差异
+	if len(enhancedProg.Calls) == len(selectedProg.Calls) {
+		sameCallCount := 0
+		for i := 0; i < len(enhancedProg.Calls); i++ {
+			if enhancedProg.Calls[i].Meta.Name == selectedProg.Calls[i].Meta.Name {
+				sameCallCount++
+			}
 		}
-		fuzzerObj.AddCandidates(candidates)
-		log.Logf(0, "已将LLM增强后的程序添加到候选队列")
+		if sameCallCount == len(enhancedProg.Calls) {
+			log.Logf(0, "【调试】调用序列相同，但可能参数不同")
+		} else {
+			log.Logf(0, "【调试】调用序列有变化，相同调用数量: %d/%d", sameCallCount, len(enhancedProg.Calls))
+		}
 	} else {
-		log.Errorf("LLM返回了空程序 (耗时: %v)", callDuration)
+		log.Logf(0, "【调试】调用数量变化: %d -> %d", len(selectedProg.Calls), len(enhancedProg.Calls))
 	}
+
+	log.Logf(0, "【调试】成功使用LLM增强程序 (耗时: %v):", callDuration)
+	log.Logf(0, "【调试】原始程序: %s", selectedProg.String())
+	log.Logf(0, "【调试】增强程序: %s", enhancedProg.String())
+
+	// 添加增强后的程序到候选队列
+	candidates := []fuzzer.Candidate{
+		{
+			Prog:  enhancedProg,
+			Flags: 0,
+		},
+	}
+
+	fuzzerObj.AddCandidates(candidates)
+	log.Logf(0, "【调试】已将LLM增强后的程序添加到候选队列")
 
 	le.lastEnhanceTime = time.Now()
 }

@@ -904,12 +904,18 @@ static void runner(char** argv, int argc)
 {
 	if (argc != 5)
 		fail("usage: syz-executor runner <index> <manager-addr> <manager-port>");
-	char* endptr = nullptr;
-	int vm_index = strtol(argv[2], &endptr, 10);
-	if (vm_index < 0 || *endptr != 0)
-		failmsg("failed to parse VM index", "str='%s'", argv[2]);
-	const char* const manager_addr = argv[3];
-	const char* const manager_port = argv[4];
+		
+	// 读取LLM配置环境变量
+	bool llm_enabled = check_env_bool("SYZ_LLM_ENABLED", false);
+	const char* llm_api_url = check_env_string("SYZ_LLM_API_URL", "http://100.64.88.112:5231");
+	int llm_stall_threshold = check_env_int("SYZ_LLM_STALL_THRESHOLD", 1000);
+	int llm_usage_frequency = check_env_int("SYZ_LLM_USAGE_FREQUENCY", 10);
+	bool llm_use_openai_format = check_env_bool("SYZ_LLM_USE_OPENAI_FORMAT", true);
+	
+	if (llm_enabled) {
+		debug("LLM API enabled: URL=%s, stall_threshold=%d, usage_frequency=%d%%, openai_format=%d\n",
+			llm_api_url, llm_stall_threshold, llm_usage_frequency, llm_use_openai_format);
+	}
 
 	struct rlimit rlim;
 	rlim.rlim_cur = rlim.rlim_max = kFdLimit;
@@ -935,6 +941,13 @@ static void runner(char** argv, int argc)
 		if (sigaction(sig, &act, nullptr))
 			failmsg("sigaction failed", "sig=%d", sig);
 	}
+
+	char* endptr = nullptr;
+	int vm_index = strtol(argv[2], &endptr, 10);
+	if (vm_index < 0 || *endptr != 0)
+		failmsg("failed to parse VM index", "str='%s'", argv[2]);
+	const char* const manager_addr = argv[3];
+	const char* const manager_port = argv[4];
 
 	Connection conn(manager_addr, manager_port);
 

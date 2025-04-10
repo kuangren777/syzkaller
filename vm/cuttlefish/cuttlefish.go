@@ -167,7 +167,7 @@ func (inst *instance) Close() error {
 	return inst.gceInst.Close()
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	return inst.gceInst.Run(timeout, stop, fmt.Sprintf("adb shell 'cd %s; %s'", deviceRoot, command))
 }

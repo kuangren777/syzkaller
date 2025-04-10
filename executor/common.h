@@ -847,3 +847,28 @@ int main(void)
 	return 0;
 }
 #endif
+
+// 添加LLM API相关环境变量处理
+static bool check_env_bool(const char* name, bool default_value)
+{
+	const char* value = getenv(name);
+	if (!value)
+		return default_value;
+	return strcmp(value, "0") != 0 && strcmp(value, "") != 0;
+}
+
+static int check_env_int(const char* name, int default_value)
+{
+	const char* value = getenv(name);
+	if (!value)
+		return default_value;
+	return atoi(value);
+}
+
+static const char* check_env_string(const char* name, const char* default_value)
+{
+	const char* value = getenv(name);
+	if (!value)
+		return default_value;
+	return value;
+}

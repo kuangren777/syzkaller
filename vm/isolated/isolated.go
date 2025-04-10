@@ -311,7 +311,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	args := append(vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, inst.cfg.SystemSSHCfg),
 		inst.User+"@"+inst.Addr)

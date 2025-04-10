@@ -271,7 +271,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	conRpipe, conWpipe, err := osutil.LongPipe()
 	if err != nil {
@@ -286,6 +286,9 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 	con := osutil.Command("ssh", conArgs...)
 	con.Env = []string{}
+	if len(env) > 0 {
+		con.Env = append(con.Env, env[0]...)
+	}
 	con.Stdout = conWpipe
 	con.Stderr = conWpipe
 	conw, err := con.StdinPipe()

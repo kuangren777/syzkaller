@@ -403,7 +403,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, fmt.Errorf("instance %s: can't push binary %s to instance over scp", inst.name, base)
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	rpipe, wpipe, err := osutil.LongPipe()
 	if err != nil {

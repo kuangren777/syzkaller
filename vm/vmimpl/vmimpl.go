@@ -48,7 +48,8 @@ type Instance interface {
 	// outc receives combined cmd and kernel console output.
 	// errc receives either command Wait return error or vmimpl.ErrTimeout.
 	// Command is terminated after timeout. Send on the stop chan can be used to terminate it earlier.
-	Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error)
+	// env is optional environment variables to pass to the command.
+	Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (outc <-chan []byte, errc <-chan error, err error)
 
 	// Diagnose retrieves additional debugging info from the VM
 	// (e.g. by sending some sys-rq's or SIGABORT'ing a Go program).

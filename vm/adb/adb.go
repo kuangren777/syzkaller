@@ -521,7 +521,7 @@ func isRemoteCuttlefish(dev string) (bool, string) {
 	return true, ip
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string, env ...[]string) (
 	<-chan []byte, <-chan error, error) {
 	var tty io.ReadCloser
 	var err error
