@@ -225,6 +225,14 @@ type Config struct {
 	// More details can be found in pkg/asset/config.go.
 	AssetStorage *asset.Config `json:"asset_storage"`
 
+	// LLM is the URL to access the LLM API for program mutation
+	// This is a top-level field for backward compatibility with existing code
+	LLM string `json:"llm,omitempty"`
+
+	// EnabledCalls represents the set of enabled system calls
+	// Used for compatibility with existing code
+	EnabledCalls map[string]bool `json:"-"`
+
 	// Experimental options.
 	Experimental Experimental
 

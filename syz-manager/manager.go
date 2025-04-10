@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"runtime/debug"
+
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/pkg/corpus"
@@ -58,6 +60,7 @@ var (
 	flagBench  = flag.String("bench", "", "write execution statistics into this file periodically")
 	flagMode   = flag.String("mode", ModeFuzzing.Name, modesDescription())
 	flagTests  = flag.String("tests", "", "prefix to match test file names (for -mode run-tests)")
+	flagLLM    = flag.Bool("llm", false, "enable LLM enhancement for fuzzing") // 添加LLM命令行参数
 )
 
 type Manager struct {
@@ -111,6 +114,8 @@ type Manager struct {
 	fsckChecker  image.FsckChecker
 
 	reproLoop *manager.ReproLoop
+
+	llmEnhancer *LLMEnhancer
 
 	Stats
 }
@@ -1423,11 +1428,22 @@ func (mgr *Manager) MaxSignal() signal.Signal {
 func (mgr *Manager) fuzzerLoop(fuzzerObj *fuzzer.Fuzzer) {
 	ctx := context.Background()
 
+	// 创建并启动覆盖率记录器，不管是否使用LLM都会记录覆盖率
+	coverageRecorder := NewCoverageRecorder(mgr, *flagLLM)
+	go coverageRecorder.Run(ctx)
+	log.Logf(0, "覆盖率记录器已启动，将定期记录覆盖率变化")
+
 	// 创建并启动LLM增强器
-	if mgr.cfg.Experimental.LLMAPIEnabled {
-		enhancer := NewLLMEnhancer(mgr)
-		go enhancer.Run(ctx)
+	if mgr.cfg.Experimental.LLMAPIEnabled && *flagLLM {
+		// 仅当同时满足配置启用和命令行参数启用时，才创建LLM增强器
+		log.Logf(0, "LLM增强已通过-llm参数和配置启用")
+		mgr.llmEnhancer = NewLLMEnhancer(mgr)
+		go mgr.llmEnhancer.Run(ctx)
 		log.Logf(0, "LLM增强器已启动，将定期对高覆盖率程序进行增强")
+	} else if *flagLLM {
+		log.Logf(0, "LLM增强器未启动：虽然指定了-llm参数，但配置中未启用LLM API")
+	} else if mgr.cfg.Experimental.LLMAPIEnabled {
+		log.Logf(0, "LLM增强器未启动：虽然配置中启用了LLM API，但未指定-llm参数")
 	}
 
 	for ; ; time.Sleep(time.Second / 2) {
@@ -1464,7 +1480,6 @@ func (mgr *Manager) fuzzerLoop(fuzzerObj *fuzzer.Fuzzer) {
 			}
 		}
 	}
-
 }
 
 func (mgr *Manager) setPhaseLocked(newPhase int) {
@@ -1766,200 +1781,575 @@ type LLMEnhancer struct {
 	lastEnhanceTime time.Time
 	enhanceInterval time.Duration // 增强间隔时间
 	mu              sync.Mutex
+
+	// 增加记录功能
+	statsFile      *os.File  // 统计数据文件
+	successFile    *os.File  // 成功序列对文件
+	startTime      time.Time // 开始运行时间
+	lastCoverage   int       // 上次记录的覆盖率
+	covChangeTimes int       // 覆盖率变化次数
+}
+
+// SequencePair 记录一对原始和增强后的程序序列
+type SequencePair struct {
+	Timestamp       string `json:"timestamp"`
+	CoverageBefore  int    `json:"coverage_before"`
+	CoverageAfter   int    `json:"coverage_after"`
+	CoverageGain    int    `json:"coverage_gain"`
+	OriginalProgram string `json:"original_program"`
+	EnhancedProgram string `json:"enhanced_program"`
+	OriginalHash    string `json:"original_hash"`
+	EnhancedHash    string `json:"enhanced_hash"`
+}
+
+type CoverageRecorder struct {
+	mgr            *Manager
+	mu             sync.Mutex
+	statsFile      *os.File  // 统计数据文件
+	startTime      time.Time // 开始运行时间
+	lastCoverage   int       // 上次记录的覆盖率
+	covChangeTimes int       // 覆盖率变化次数
+}
+
+// 创建新的覆盖率记录器
+func NewCoverageRecorder(mgr *Manager, useLLM bool) *CoverageRecorder {
+	// 创建统计文件目录
+	statsDir := filepath.Join(mgr.cfg.Workdir, "coverage_stats")
+	os.MkdirAll(statsDir, 0755)
+
+	// 创建文件名，包含时间戳和模式标记
+	timeStr := time.Now().Format("2006-01-02_15-04-05")
+	modeTag := "normal"
+	if useLLM {
+		modeTag = "llm"
+	}
+	statsFilePath := filepath.Join(statsDir, fmt.Sprintf("coverage_stats_%s_%s.csv", modeTag, timeStr))
+
+	// 创建并打开统计文件
+	statsFile, err := os.Create(statsFilePath)
+	if err != nil {
+		log.Errorf("无法创建覆盖率统计文件: %v", err)
+	} else {
+		// 写入CSV头
+		statsFile.WriteString("timestamp,seconds_elapsed,coverage,corpus_size,cov_change_times\n")
+		log.Logf(0, "已创建覆盖率统计文件 (%s模式): %s", modeTag, statsFilePath)
+	}
+
+	startTime := time.Now()
+
+	return &CoverageRecorder{
+		mgr:            mgr,
+		statsFile:      statsFile,
+		startTime:      startTime,
+		lastCoverage:   0,
+		covChangeTimes: 0,
+	}
+}
+
+// 运行覆盖率记录循环
+func (cr *CoverageRecorder) Run(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			cr.Close()
+			return
+		case <-ticker.C:
+			cr.recordCurrentCoverage()
+		}
+	}
+}
+
+// 关闭文件
+func (cr *CoverageRecorder) Close() {
+	if cr.statsFile != nil {
+		cr.statsFile.Close()
+		cr.statsFile = nil
+	}
+}
+
+// 记录当前覆盖率
+func (cr *CoverageRecorder) recordCurrentCoverage() {
+	if cr.statsFile == nil {
+		return
+	}
+
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	fuzzerObj := cr.mgr.fuzzer.Load()
+	if fuzzerObj == nil {
+		return
+	}
+
+	var corpusSize int
+	var currentCoverage int
+
+	// 获取当前覆盖率
+	if fuzzerObj.Cover != nil {
+		currentCoverage = fuzzerObj.Cover.Count()
+	}
+
+	// 获取Corpus大小
+	if cr.mgr.corpus != nil {
+		corpusSize = cr.mgr.corpus.StatProgs.Val()
+	}
+
+	// 检查覆盖率是否变化
+	if currentCoverage != cr.lastCoverage {
+		cr.covChangeTimes++
+		cr.lastCoverage = currentCoverage
+	}
+
+	// 计算经过的秒数
+	secondsElapsed := int(time.Since(cr.startTime).Seconds())
+
+	// 写入统计数据
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	statsLine := fmt.Sprintf("%s,%d,%d,%d,%d\n",
+		timestamp, secondsElapsed, currentCoverage, corpusSize, cr.covChangeTimes)
+
+	cr.statsFile.WriteString(statsLine)
+	cr.statsFile.Sync()
 }
 
 // 创建新的LLM增强器
 func NewLLMEnhancer(mgr *Manager) *LLMEnhancer {
+	// 创建统计文件目录
+	statsDir := filepath.Join(mgr.cfg.Workdir, "llm_stats")
+	os.MkdirAll(statsDir, 0755)
+
+	// 创建文件名，包含时间戳和llm标记
+	timeStr := time.Now().Format("2006-01-02_15-04-05")
+	statsFilePath := filepath.Join(statsDir, fmt.Sprintf("coverage_stats_llm_%s.csv", timeStr))
+	successFilePath := filepath.Join(statsDir, fmt.Sprintf("success_sequences_llm_%s.jsonl", timeStr))
+
+	// 创建并打开统计文件
+	statsFile, err := os.Create(statsFilePath)
+	if err != nil {
+		log.Errorf("无法创建LLM统计文件: %v", err)
+	} else {
+		// 写入CSV头
+		statsFile.WriteString("timestamp,seconds_elapsed,coverage,corpus_size,cov_change_times\n")
+	}
+
+	// 创建并打开成功序列文件
+	successFile, err := os.Create(successFilePath)
+	if err != nil {
+		log.Errorf("无法创建LLM成功序列文件: %v", err)
+	} else {
+		// JSONL格式不需要特殊的文件头
+		log.Logf(0, "已创建系统调用序列记录文件 (JSONL格式): %s", successFilePath)
+	}
+
+	startTime := time.Now()
+
+	// 设置初始增强间隔为10秒，更快开始第一次后的增强
+	enhanceInterval := 10 * time.Second
+	log.Logf(0, "【调试】创建LLM增强器，初始增强间隔为%v", enhanceInterval)
+
 	return &LLMEnhancer{
 		mgr:             mgr,
 		lastEnhanceTime: time.Now(),
-		enhanceInterval: 30 * time.Second, // 将默认间隔改为30秒
+		enhanceInterval: enhanceInterval,
+		statsFile:       statsFile,
+		successFile:     successFile,
+		startTime:       startTime,
+		lastCoverage:    0,
+		covChangeTimes:  0,
 	}
 }
 
 // 运行LLM增强循环
 func (le *LLMEnhancer) Run(ctx context.Context) {
+	// 定期重启，防止因单次panic停止整个增强过程
+	defer func() {
+		if r := recover(); r != nil {
+			log.Logf(0, "【严重错误】LLM增强器运行时发生panic: %v，将在5秒后重启", r)
+			debug.PrintStack() // 打印堆栈跟踪以便调试
+			time.Sleep(5 * time.Second)
+			go le.Run(ctx) // 重新启动增强器
+		}
+	}()
+
+	// 添加健康检查
+	healthTicker := time.NewTicker(1 * time.Minute) // 降低到1分钟
+	defer healthTicker.Stop()
+
+	// 原有代码
+	go le.recordCoverageStats()
+
+	log.Logf(0, "【调试】LLM增强循环开始运行，使用%v的增强间隔", le.enhanceInterval)
+
+	enhanceCount := 0
+	lastTickTime := time.Now()
+
 	for {
+		now := time.Now()
+		log.Logf(3, "【循环跟踪】LLM增强器循环迭代，距上次: %v", now.Sub(lastTickTime))
+		lastTickTime = now
+
 		select {
 		case <-ctx.Done():
+			log.Logf(0, "【调试】LLM增强器收到终止信号，即将关闭")
+			le.closeFiles()
 			return
+
+		case <-healthTicker.C:
+			// 定期健康检查
+			log.Logf(0, "【健康】LLM增强器健康检查：已运行%d次增强", enhanceCount)
+			// 强制记录一次当前状态
+			le.mu.Lock()
+			lastTime := le.lastEnhanceTime
+			interval := le.enhanceInterval
+			le.mu.Unlock()
+			timeNow := time.Now()
+			timeElapsed := timeNow.Sub(lastTime)
+			log.Logf(0, "【健康】上次增强时间: %v, 当前时间: %v, 已过时间: %v, 需要间隔: %v",
+				lastTime.Format("15:04:05.000"), timeNow.Format("15:04:05.000"),
+				timeElapsed, interval)
+
 		case <-time.After(5 * time.Second): // 每5秒检查一次
-			le.enhanceWithLLM()
+			// 用匿名函数包装增强操作，使panic不会导致整个循环终止
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logf(0, "【警告】enhanceWithLLM发生panic: %v", r)
+						debug.PrintStack() // 打印堆栈跟踪以便调试
+					}
+				}()
+
+				log.Logf(1, "【调试】尝试运行LLM增强操作...")
+				le.enhanceWithLLM()
+				enhanceCount++
+			}()
 		}
 	}
+}
+
+// 关闭文件
+func (le *LLMEnhancer) closeFiles() {
+	if le.statsFile != nil {
+		le.statsFile.Close()
+		le.statsFile = nil
+	}
+	if le.successFile != nil {
+		le.successFile.Close()
+		le.successFile = nil
+	}
+}
+
+// 定期记录覆盖率统计信息
+func (le *LLMEnhancer) recordCoverageStats() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		le.recordCurrentCoverage()
+	}
+}
+
+// 记录当前覆盖率
+func (le *LLMEnhancer) recordCurrentCoverage() {
+	if le.statsFile == nil {
+		return
+	}
+
+	le.mu.Lock()
+	defer le.mu.Unlock()
+
+	fuzzerObj := le.mgr.fuzzer.Load()
+	if fuzzerObj == nil {
+		return
+	}
+
+	var corpusSize int
+	var currentCoverage int
+
+	// 获取当前覆盖率
+	if fuzzerObj.Cover != nil {
+		currentCoverage = fuzzerObj.Cover.Count()
+	}
+
+	// 获取Corpus大小
+	if le.mgr.corpus != nil {
+		corpusSize = le.mgr.corpus.StatProgs.Val()
+	}
+
+	// 检查覆盖率是否变化
+	if currentCoverage != le.lastCoverage {
+		le.covChangeTimes++
+		le.lastCoverage = currentCoverage
+	}
+
+	// 计算经过的秒数
+	secondsElapsed := int(time.Since(le.startTime).Seconds())
+
+	// 写入统计数据
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	statsLine := fmt.Sprintf("%s,%d,%d,%d,%d\n",
+		timestamp, secondsElapsed, currentCoverage, corpusSize, le.covChangeTimes)
+
+	le.statsFile.WriteString(statsLine)
+	le.statsFile.Sync()
+}
+
+// 记录成功的序列对
+func (le *LLMEnhancer) recordSuccessSequence(originalProg, enhancedProg *prog.Prog, coverageBefore, coverageAfter int) {
+	if le.successFile == nil {
+		log.Errorf("【错误】无法记录成功序列：序列保存文件为nil")
+		return
+	}
+
+	le.mu.Lock()
+	defer le.mu.Unlock()
+
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	log.Logf(0, "【调试】开始记录成功序列，时间戳: %s", timestamp)
+
+	// 格式化原始和增强后的程序
+	originalStr := originalProg.String()
+	enhancedStr := enhancedProg.String()
+
+	// 记录程序长度，便于调试
+	log.Logf(0, "【调试】原始程序长度: %d, 增强程序长度: %d",
+		len(originalStr), len(enhancedStr))
+
+	// 计算哈希（可选）
+	originalHash := fmt.Sprintf("%x", sha1.Sum([]byte(originalStr)))
+	enhancedHash := fmt.Sprintf("%x", sha1.Sum([]byte(enhancedStr)))
+
+	log.Logf(0, "【调试】原始哈希: %s, 增强哈希: %s",
+		originalHash, enhancedHash)
+
+	record := SequencePair{
+		Timestamp:       timestamp,
+		CoverageBefore:  coverageBefore,
+		CoverageAfter:   coverageAfter,
+		CoverageGain:    coverageAfter - coverageBefore,
+		OriginalProgram: originalStr,
+		EnhancedProgram: enhancedStr,
+		OriginalHash:    originalHash,
+		EnhancedHash:    enhancedHash,
+	}
+
+	// 将JSON对象序列化为一行
+	jsonData, err := json.Marshal(record)
+	if err != nil {
+		log.Errorf("【错误】序列化JSON失败: %v", err)
+		return
+	}
+
+	log.Logf(0, "【调试】JSON数据长度: %d字节", len(jsonData))
+
+	// 写入JSONL格式（每行一个JSON对象）
+	bytesWritten, err := le.successFile.Write(jsonData)
+	if err != nil {
+		log.Errorf("【错误】写入JSONL数据失败: %v", err)
+		return
+	}
+
+	// 写入换行符
+	_, err = le.successFile.WriteString("\n")
+	if err != nil {
+		log.Errorf("【错误】写入换行符失败: %v", err)
+		return
+	}
+
+	// 确保写入磁盘
+	err = le.successFile.Sync()
+	if err != nil {
+		log.Errorf("【错误】同步文件到磁盘失败: %v", err)
+		return
+	}
+
+	log.Logf(0, "【调试】成功写入序列对数据：%d字节, 覆盖率: %d -> %d (+%d)",
+		bytesWritten, coverageBefore, coverageAfter, coverageAfter-coverageBefore)
+
+	// 检查文件大小以确保数据被写入
+	fileInfo, err := le.successFile.Stat()
+	if err != nil {
+		log.Errorf("【错误】获取文件状态失败: %v", err)
+	} else {
+		log.Logf(0, "【调试】当前序列文件大小: %d字节", fileInfo.Size())
+	}
+}
+
+// 格式化程序调用序列（带详细信息）
+func formatProgCallsWithDetails(p *prog.Prog) string {
+	if p == nil {
+		return "nil"
+	}
+
+	return p.String()
 }
 
 // 使用LLM进行增强
 func (le *LLMEnhancer) enhanceWithLLM() {
 	le.mu.Lock()
-	defer le.mu.Unlock()
+	timeSinceLast := time.Since(le.lastEnhanceTime)
+	log.Logf(0, "【增强检查】当前时间: %v, 上次增强时间: %v, 已过时间: %v, 需要间隔: %v",
+		time.Now().Format("15:04:05.000"),
+		le.lastEnhanceTime.Format("15:04:05.000"),
+		timeSinceLast, le.enhanceInterval)
 
-	// 检查是否需要增强
-	if time.Since(le.lastEnhanceTime) < le.enhanceInterval {
+	if timeSinceLast < le.enhanceInterval {
+		log.Logf(0, "【调试】LLM增强器间隔未到，跳过本次增强 (已过时间: %v, 需要间隔: %v)", timeSinceLast, le.enhanceInterval)
+		le.mu.Unlock()
 		return
 	}
+	log.Logf(0, "【调试】LLM增强器间隔已到，准备开始新的增强 (已过时间: %v > 间隔: %v)", timeSinceLast, le.enhanceInterval)
 
+	// 先更新时间戳，防止重复启动增强（在增强过程中发生其他操作时）
+	le.lastEnhanceTime = time.Now()
+	le.mu.Unlock()
+
+	log.Logf(0, "【调试】开始LLM增强，API URL: %s", le.mgr.cfg.LLM)
+	log.Logf(0, "【调试】LLM配置: UseOpenAIFormat=%v", le.mgr.cfg.EnabledCalls != nil)
+
+	// 测试API连接
+	apiURL := le.mgr.cfg.LLM
+	if err := testLLMAPIAvailability(apiURL); err != nil {
+		log.Logf(0, "【错误】LLM API连接失败: %v", err)
+		return
+	}
+	log.Logf(0, "【调试】LLM API连接测试成功")
+
+	// 获取语料库
 	le.mgr.mu.Lock()
 	fuzzerObj := le.mgr.fuzzer.Load()
 	le.mgr.mu.Unlock()
 
 	if fuzzerObj == nil {
-		log.Errorf("【调试】无法获取fuzzer实例，跳过LLM增强")
+		log.Logf(0, "【错误】无法获取fuzzer实例")
 		return
 	}
 
-	// 检查fuzzer配置
-	if fuzzerObj.Config == nil {
-		log.Errorf("【调试】fuzzer配置为空，跳过LLM增强")
-		return
-	}
-
-	if fuzzerObj.Config.LLMConfig == nil {
-		log.Errorf("【调试】LLM配置为空，跳过LLM增强")
-		return
-	}
-
-	if !fuzzerObj.Config.LLMConfig.Enabled {
-		log.Errorf("【调试】LLM功能未启用，跳过LLM增强")
-		return
-	}
-
-	apiURL := fuzzerObj.Config.LLMConfig.APIURL
-	log.Logf(0, "【调试】开始LLM增强，API URL: %s", apiURL)
-	log.Logf(0, "【调试】LLM配置: UseOpenAIFormat=%v, StallThreshold=%d, UsageFrequency=%d",
-		fuzzerObj.Config.LLMConfig.UseOpenAIFormat,
-		fuzzerObj.Config.LLMConfig.StallThreshold,
-		fuzzerObj.Config.LLMConfig.UsageFrequency)
-
-	// 测试LLM API可用性
-	if err := testLLMAPIAvailability(apiURL); err != nil {
-		log.Errorf("【调试】LLM API不可用: %v", err)
-		return
-	}
-	log.Logf(0, "【调试】LLM API连接测试成功")
-
-	// 获取当前语料库中的所有程序
 	items := le.mgr.getMinimizedCorpus()
 	if len(items) == 0 {
-		log.Logf(0, "【调试】语料库为空，跳过LLM增强")
+		log.Logf(0, "【警告】LLM增强：没有可用的语料库程序")
 		return
 	}
 	log.Logf(0, "【调试】Corpus大小: %d", len(items))
 
-	// 选择覆盖率较高的程序进行增强
-	// 按覆盖率信号数量排序
-	sort.Slice(items, func(i, j int) bool {
-		return len(items[i].Signal) > len(items[j].Signal)
-	})
-
-	// 取前N个程序
-	topN := 10
-	if len(items) < topN {
-		topN = len(items)
+	// 获取当前覆盖率基线
+	coverageBefore := 0
+	if fuzzerObj.Cover != nil {
+		coverageBefore = fuzzerObj.Cover.Count()
 	}
+	log.Logf(0, "【调试】当前覆盖率基线: %d", coverageBefore)
 
-	// 随机选择一个程序
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	// 多尝试几次，以防某个程序变异失败
-	maxTries := 3
-	var enhancedProg *prog.Prog
-	var err error
-	var selectedProg *prog.Prog
-	var originalHash string
-	var enhancedHash string
-	var selectedIdx int
-	var startTime time.Time
-	var callDuration time.Duration
-
-	for try := 0; try < maxTries; try++ {
-		selectedIdx = rnd.Intn(topN)
-		selectedProg = items[selectedIdx].Prog
-
-		log.Logf(0, "【调试】尝试 #%d: 选择的程序 #%d, 覆盖率信号数: %d",
-			try+1, selectedIdx, len(items[selectedIdx].Signal))
-		log.Logf(0, "【调试】选择的程序内容: %s", selectedProg.String())
-
-		// 使用LLM增强程序
-		startTime = time.Now()
-
-		// 获取原始种子程序的哈希
-		originalSeed := selectedProg.Serialize()
-		originalHash = fmt.Sprintf("%x", sha1.Sum(originalSeed))
-		log.Logf(0, "【调试】原始程序哈希: %s", originalHash)
-
-		// 再次确认LLM配置存在
-		if fuzzerObj.Config == nil || fuzzerObj.Config.LLMConfig == nil {
-			log.Errorf("【调试】LLM配置在调用前变为nil，跳过LLM增强")
+	// 最多尝试5个程序进行增强
+	maxTries := 5
+	for i := 0; i < maxTries; i++ {
+		// 随机选择一个程序
+		if len(items) == 0 {
+			log.Logf(0, "【警告】没有可用的程序进行增强")
 			return
 		}
 
-		enhancedProg, err = fuzzerObj.UseLLMForMutation(selectedProg.Clone())
-		callDuration = time.Since(startTime)
+		randIndex := rand.Intn(len(items))
+		prog := items[randIndex].Prog
+
+		// 检查程序大小
+		if len(prog.Calls) < 1 || len(prog.Calls) > 20 {
+			log.Logf(0, "【调试】跳过程序 #%d: 调用数量不适合 (%d)", randIndex, len(prog.Calls))
+			continue
+		}
+
+		// 检查程序的信号
+		signalSize := len(items[randIndex].Signal)
+		log.Logf(0, "【调试】尝试 #%d: 选择的程序 #%d, 信号数: %d", i+1, randIndex, signalSize)
+
+		// 输出程序详情
+		log.Logf(0, "【调试】选择的程序内容: %s", prog.String())
+
+		// 计算程序哈希
+		originalHash := fmt.Sprintf("%x", sha1.Sum([]byte(prog.Serialize())))
+		log.Logf(0, "【调试】原始程序哈希: %s", originalHash)
+
+		// 使用LLM增强程序
+		startTime := time.Now()
+		enhancedProg, err := fuzzerObj.UseLLMForMutation(prog.Clone())
+		callDuration := time.Since(startTime)
 
 		if err != nil {
-			log.Errorf("【调试】LLM增强调用失败 (耗时: %v): %v", callDuration, err)
-			continue // 尝试下一个程序
+			log.Logf(0, "【错误】LLM增强调用失败 (耗时: %v): %v", callDuration, err)
+			continue
 		}
 
 		if enhancedProg == nil {
-			log.Errorf("【调试】LLM返回了空程序 (耗时: %v)", callDuration)
-			continue // 尝试下一个程序
+			log.Logf(0, "【错误】LLM返回了空程序 (耗时: %v)", callDuration)
+			continue
 		}
 
-		// 校验增强后的程序是否与原始程序相同
-		enhancedSeed := enhancedProg.Serialize()
-		enhancedHash = fmt.Sprintf("%x", sha1.Sum(enhancedSeed))
+		// 校验增强后的程序
+		enhancedHash := fmt.Sprintf("%x", sha1.Sum([]byte(enhancedProg.Serialize())))
 		log.Logf(0, "【调试】增强后程序哈希: %s", enhancedHash)
 
-		if originalHash != enhancedHash {
-			// 找到有效的变异，跳出循环
-			log.Logf(0, "【调试】成功变异程序，哈希不同")
-			break
+		if originalHash == enhancedHash {
+			log.Logf(0, "【警告】LLM未对程序做出任何改变，哈希相同")
+			continue
 		}
 
-		log.Errorf("【调试】LLM未对程序做出任何改变，哈希相同，尝试另一个程序")
-	}
+		log.Logf(0, "【成功】LLM成功变异程序 (耗时: %v)", callDuration)
+		log.Logf(0, "【调试】原始程序: %s", prog.String())
+		log.Logf(0, "【调试】增强程序: %s", enhancedProg.String())
 
-	// 如果所有尝试都失败，退出
-	if originalHash == enhancedHash || enhancedProg == nil {
-		log.Errorf("【调试】经过%d次尝试，无法生成有效变异", maxTries)
-		return
-	}
+		// 添加到候选队列
+		candidates := []fuzzer.Candidate{
+			{
+				Prog:  enhancedProg,
+				Flags: 0,
+			},
+		}
 
-	// 检查增强后的程序与原始程序的差异
-	if len(enhancedProg.Calls) == len(selectedProg.Calls) {
-		sameCallCount := 0
-		for i := 0; i < len(enhancedProg.Calls); i++ {
-			if enhancedProg.Calls[i].Meta.Name == selectedProg.Calls[i].Meta.Name {
-				sameCallCount++
+		fuzzerObj.AddCandidates(candidates)
+		log.Logf(0, "【调试】已将LLM增强后的程序添加到候选队列")
+
+		// 等待覆盖率更新
+		log.Logf(0, "【调试】等待5秒钟让覆盖率更新...")
+		time.Sleep(5 * time.Second)
+
+		// 获取增强后的覆盖率
+		coverageAfter := 0
+		if fuzzerObj.Cover != nil {
+			coverageAfter = fuzzerObj.Cover.Count()
+		}
+
+		log.Logf(0, "【调试】覆盖率检查: 之前=%d, 之后=%d, 差异=%d",
+			coverageBefore, coverageAfter, coverageAfter-coverageBefore)
+
+		// 如果覆盖率有提升，记录成功序列
+		if coverageAfter > coverageBefore {
+			log.Logf(0, "【成功】检测到覆盖率提升: %d -> %d (+%d)",
+				coverageBefore, coverageAfter, coverageAfter-coverageBefore)
+
+			// 确保记录文件存在
+			if le.successFile == nil {
+				statsDir := filepath.Join(le.mgr.cfg.Workdir, "llm_stats")
+				os.MkdirAll(statsDir, 0755)
+				timeStr := time.Now().Format("2006-01-02_15-04-05")
+				successFilePath := filepath.Join(statsDir, fmt.Sprintf("success_sequences_%s.jsonl", timeStr))
+				newFile, err := os.Create(successFilePath)
+				if err != nil {
+					log.Logf(0, "【错误】无法创建序列文件: %v", err)
+				} else {
+					le.successFile = newFile
+					log.Logf(0, "【调试】已创建新的序列记录文件: %s", successFilePath)
+				}
 			}
+
+			le.recordSuccessSequence(prog, enhancedProg, coverageBefore, coverageAfter)
 		}
-		if sameCallCount == len(enhancedProg.Calls) {
-			log.Logf(0, "【调试】调用序列相同，但可能参数不同")
-		} else {
-			log.Logf(0, "【调试】调用序列有变化，相同调用数量: %d/%d", sameCallCount, len(enhancedProg.Calls))
-		}
-	} else {
-		log.Logf(0, "【调试】调用数量变化: %d -> %d", len(selectedProg.Calls), len(enhancedProg.Calls))
+
+		// 找到了有效变异，退出循环
+		break
 	}
 
-	log.Logf(0, "【调试】成功使用LLM增强程序 (耗时: %v):", callDuration)
-	log.Logf(0, "【调试】原始程序: %s", selectedProg.String())
-	log.Logf(0, "【调试】增强程序: %s", enhancedProg.String())
-
-	// 添加增强后的程序到候选队列
-	candidates := []fuzzer.Candidate{
-		{
-			Prog:  enhancedProg,
-			Flags: 0,
-		},
-	}
-
-	fuzzerObj.AddCandidates(candidates)
-	log.Logf(0, "【调试】已将LLM增强后的程序添加到候选队列")
-
-	le.lastEnhanceTime = time.Now()
+	log.Logf(0, "【调试】LLM增强操作完成，下次增强将在%v后进行", le.enhanceInterval)
 }
 
 // 添加LLM API可用性测试函数

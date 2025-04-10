@@ -689,15 +689,71 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		fuzzer.Logf(0, "【调试】成功找到系统调用: %s，将替换位置 %d 的调用 %s",
 			syscall.Name, mutation.Position, originalCallName)
 
-		// 创建新的系统调用
-		call := prog.MakeCall(syscall, nil)
-		if call == nil {
-			return nil, fmt.Errorf("无法创建调用: %s", mutation.NewCall)
-		}
-
-		// 替换系统调用
+		// 安全地创建新系统调用
 		if mutation.Position < callCount {
-			newProg.Calls[mutation.Position] = call
+			// 保存旧程序的调用顺序
+			oldCalls := make([]*prog.Call, len(newProg.Calls))
+			copy(oldCalls, newProg.Calls)
+
+			// 创建新的系统调用
+			call := prog.MakeCall(syscall, nil)
+			if call == nil {
+				return nil, fmt.Errorf("无法创建调用: %s", mutation.NewCall)
+			}
+
+			// 创建新的程序，确保完全重新生成所有参数
+			rebuiltProg := &prog.Prog{Target: fuzzer.target}
+
+			// 重建程序，将新调用放在适当位置
+			for i, oldCall := range oldCalls {
+				if i == mutation.Position {
+					// 在此位置使用新调用
+					rebuiltProg.Calls = append(rebuiltProg.Calls, call)
+				} else {
+					// 重新创建原始调用以保持一致性
+					newCall := prog.MakeCall(oldCall.Meta, nil)
+					if newCall != nil {
+						rebuiltProg.Calls = append(rebuiltProg.Calls, newCall)
+					}
+				}
+			}
+
+			if len(rebuiltProg.Calls) > 0 {
+				// 如果重建程序有调用，使用它
+				newProg = rebuiltProg
+			} else {
+				// 重建失败，回退到保守方法
+				fuzzer.Logf(0, "【调试】程序重建失败，尝试更简单的方法")
+				// 尝试简单地将原调用替换为新调用
+				try := func() (ok bool) {
+					defer func() {
+						if r := recover(); r != nil {
+							fuzzer.Logf(0, "【调试】替换调用时发生panic: %v", r)
+							ok = false
+						}
+					}()
+
+					newProg = p.Clone()
+					call = prog.MakeCall(syscall, nil)
+					if call != nil && mutation.Position < len(newProg.Calls) {
+						newProg.Calls[mutation.Position] = call
+						ok = true
+					}
+					return
+				}
+
+				if !try() {
+					// 如果替换也失败，创建一个只包含新调用的程序
+					fuzzer.Logf(0, "【调试】替换也失败，创建只有新调用的程序")
+					newProg = &prog.Prog{Target: fuzzer.target}
+					call = prog.MakeCall(syscall, nil)
+					if call != nil {
+						newProg.Calls = append(newProg.Calls, call)
+					} else {
+						return nil, fmt.Errorf("无法创建有效的替换调用")
+					}
+				}
+			}
 		}
 	}
 
@@ -706,10 +762,23 @@ func (fuzzer *Fuzzer) applyLLMMutation(p *prog.Prog, mutation *LLMMutation) (*pr
 		return nil, fmt.Errorf("变异后无有效调用")
 	}
 
-	// 尝试序列化程序，确保它是有效的
-	serialized := newProg.Serialize()
-	if len(serialized) == 0 {
-		return nil, fmt.Errorf("变异后程序无法序列化")
+	// 安全地尝试序列化程序
+	var serialized []byte
+	try := func() (ok bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				fuzzer.Logf(0, "【调试】序列化程序时发生panic: %v", r)
+				ok = false
+			}
+		}()
+
+		serialized = newProg.Serialize()
+		ok = len(serialized) > 0
+		return
+	}
+
+	if !try() {
+		return nil, fmt.Errorf("变异后程序无法安全序列化")
 	}
 
 	// 校验序列化后的程序是否与原始程序不同

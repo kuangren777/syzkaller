@@ -65,5 +65,10 @@ func (mgr *Manager) tryEnhanceWithLLM() {
 	}
 
 	log.Logf(1, "开始LLM增强...")
-	fuzzerObj.EnhanceWithLLM()
+	// 使用Manager中的LLMEnhancer来实现增强功能
+	if enhancer := mgr.llmEnhancer; enhancer != nil {
+		enhancer.enhanceWithLLM()
+	} else {
+		log.Logf(1, "LLM增强器未初始化")
+	}
 }

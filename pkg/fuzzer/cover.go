@@ -49,3 +49,10 @@ func (cover *Cover) GrabSignalDelta() signal.Signal {
 	cover.newSignal = nil
 	return plus
 }
+
+// Count 返回当前覆盖率计数
+func (cover *Cover) Count() int {
+	cover.mu.RLock()
+	defer cover.mu.RUnlock()
+	return len(cover.maxSignal)
+}
