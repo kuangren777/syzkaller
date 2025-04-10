@@ -185,7 +185,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	p := job.p
 	if job.flags&ProgMinimized == 0 {
 		p, call = job.minimize(call, info)
-		if p == nil {
+		if p == nil || call < 0 || call >= len(p.Calls) {
 			return
 		}
 	}
@@ -358,6 +358,12 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 
 func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 	job.info.Logf("[call #%d] minimize started", call)
+	// 检查程序和调用的有效性
+	if job.p == nil || len(job.p.Calls) == 0 || call < 0 || call >= len(job.p.Calls) {
+		job.info.Logf("[call #%d] 跳过最小化: 程序为空或调用无效", call)
+		return nil, -1
+	}
+
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
 		minimizeAttempts = 2
@@ -367,6 +373,13 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 	if job.fuzzer.Config.PatchTest {
 		mode = prog.MinimizeCallsOnly
 	}
+
+	// 再次检查程序是否有效
+	if job.p == nil || len(job.p.Calls) == 0 {
+		job.info.Logf("[call #%d] 跳过Minimize: 程序为空或没有调用", call)
+		return nil, -1
+	}
+
 	p, call := prog.Minimize(job.p, call, mode, func(p1 *prog.Prog, call1 int) bool {
 		if stop {
 			return false

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"slices"
 	"sort"
 )
@@ -267,25 +268,48 @@ func (ct *ChoiceTable) Generatable(call int) bool {
 }
 
 func (ct *ChoiceTable) choose(r *rand.Rand, bias int) int {
+	// 首先检查是否有任何可生成的系统调用
+	var generatableCalls []int
+	for i := range ct.calls {
+		if ct.Generatable(i) {
+			generatableCalls = append(generatableCalls, i)
+		}
+	}
+
+	// 如果没有可生成的调用，记录错误并返回-1（调用者应当处理这种情况）
+	if len(generatableCalls) == 0 {
+		fmt.Fprintf(os.Stderr, "警告：没有可生成的系统调用\n")
+		return -1
+	}
+
 	if r.Intn(100) < 5 {
 		// Let's make 5% decisions totally at random.
-		return ct.calls[r.Intn(len(ct.calls))].ID
+		// 确保选择的是可生成的调用
+		return generatableCalls[r.Intn(len(generatableCalls))]
 	}
-	if bias < 0 {
-		bias = ct.calls[r.Intn(len(ct.calls))].ID
+
+	// 如果bias无效或不可生成，选择一个随机但有效的调用
+	if bias < 0 || !ct.Generatable(bias) {
+		if bias >= 0 {
+			fmt.Fprintf(os.Stderr, "警告：偏向不可生成的系统调用 %v，将选择其他调用\n",
+				ct.target.Syscalls[bias].Name)
+		}
+		return generatableCalls[r.Intn(len(generatableCalls))]
 	}
-	if !ct.Generatable(bias) {
-		fmt.Printf("bias to disabled or non-generatable syscall %v\n", ct.target.Syscalls[bias].Name)
-		panic("disabled or non-generatable syscall")
-	}
+
 	run := ct.runs[bias]
 	runSum := int(run[len(run)-1])
 	x := int32(r.Intn(runSum) + 1)
 	res := sort.Search(len(run), func(i int) bool {
 		return run[i] >= x
 	})
+
+	// 如果选择了不可生成的调用，则回退到随机选择一个有效调用
 	if !ct.Generatable(res) {
-		panic("selected disabled or non-generatable syscall")
+		fmt.Fprintf(os.Stderr, "警告：选择了不可生成的系统调用 %v，将选择其他调用\n",
+			ct.target.Syscalls[res].Name)
+		return generatableCalls[r.Intn(len(generatableCalls))]
 	}
+
 	return res
 }

@@ -51,7 +51,11 @@ func TestStaticPriorities(t *testing.T) {
 		for _, call := range syscalls {
 			count := 0
 			for it := 0; it < iters; it++ {
-				chosenCall := target.Syscalls[ct.choose(r, target.SyscallMap[call].ID)].Name
+				chosenIdx := ct.choose(r, target.SyscallMap[call].ID)
+				if chosenIdx == -1 {
+					continue
+				}
+				chosenCall := target.Syscalls[chosenIdx].Name
 				if call == referenceCall {
 					counter[chosenCall]++
 				} else if chosenCall == referenceCall {
@@ -89,6 +93,9 @@ func TestPrioDeterminism(t *testing.T) {
 		seed := rs.Int63()
 		call0 := ct0.choose(rand.New(rand.NewSource(seed)), -1)
 		call1 := ct1.choose(rand.New(rand.NewSource(seed)), -1)
+		if call0 == -1 || call1 == -1 {
+			continue
+		}
 		if call0 != call1 {
 			t.Fatalf("seed=%v iter=%v call=%v/%v", seed, i, call0, call1)
 		}

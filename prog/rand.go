@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -597,6 +598,14 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 		}
 	}
 	idx := s.ct.choose(r.Rand, biasCall)
+
+	// 处理choose函数返回-1的情况
+	if idx == -1 {
+		// 找不到可生成的系统调用，记录警告并返回空
+		fmt.Fprintf(os.Stderr, "警告：无法找到可生成的系统调用，跳过生成\n")
+		return nil
+	}
+
 	meta := r.target.Syscalls[idx]
 	return r.generateParticularCall(s, meta)
 }

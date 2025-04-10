@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 
 	"github.com/google/syzkaller/pkg/image"
@@ -194,6 +195,14 @@ func (ctx *mutator) insertCall() bool {
 	}
 	s := analyze(ctx.ct, ctx.corpus, p, c)
 	calls := r.generateCall(s, p, idx)
+
+	// 处理generateCall返回nil的情况
+	if calls == nil {
+		// 无法生成调用，记录日志并返回
+		fmt.Fprintf(os.Stderr, "警告：insertCall无法生成系统调用\n")
+		return false
+	}
+
 	p.insertBefore(c, calls)
 	for len(p.Calls) > ctx.ncalls {
 		p.RemoveCall(idx)

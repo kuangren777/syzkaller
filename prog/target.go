@@ -301,6 +301,28 @@ func (target *Target) GetConst(name string) uint64 {
 }
 
 func (target *Target) sanitize(c *Call, fix bool) error {
+	// 添加安全检查，确保调用有效
+	if c == nil {
+		if fix {
+			// 在修复模式下，我们希望验证程序健壮性，所以返回错误而不是panic
+			return fmt.Errorf("无效的调用：调用为nil")
+		}
+		// 在非修复模式下，什么都不做
+		return nil
+	}
+
+	if c.Meta == nil {
+		if fix {
+			return fmt.Errorf("无效的调用：元数据为nil")
+		}
+		return nil
+	}
+
+	// 检查中立化函数是否存在
+	if target.Neutralize == nil {
+		return nil
+	}
+
 	// For now, even though we accept the fix argument, it does not have the full effect.
 	// It de facto only denies structural changes, e.g. deletions of arguments.
 	// TODO: rewrite the corresponding sys/*/init.go code.

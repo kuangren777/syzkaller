@@ -89,19 +89,41 @@ func (arch *UnixNeutralizer) Neutralize(c *prog.Call, fixStructure bool) error {
 			// Mali bifrost mmap doesn't support MAP_FIXED.
 			return nil
 		}
+		// 检查参数数量是否足够
+		if len(c.Args) <= 3 {
+			return nil // 参数不足，跳过处理
+		}
+		// 检查第4个参数是否为ConstArg类型
+		flagArg, ok := c.Args[3].(*prog.ConstArg)
+		if !ok {
+			return nil
+		}
 		// Add MAP_FIXED flag, otherwise it produces non-deterministic results.
-		c.Args[3].(*prog.ConstArg).Val |= arch.MAP_FIXED
+		flagArg.Val |= arch.MAP_FIXED
 	case "mknod", "mknodat", "compat_50_mknod":
 		pos := 1
 		if c.Meta.CallName == "mknodat" {
 			pos = 2
 		}
+		// 检查参数数量是否足够
+		if len(c.Args) <= pos+1 {
+			return nil // 参数不足，跳过处理
+		}
 		switch c.Args[pos+1].Type().(type) {
 		case *prog.ProcType, *prog.ResourceType:
 			return nil
 		}
-		mode := c.Args[pos].(*prog.ConstArg)
-		dev := c.Args[pos+1].(*prog.ConstArg)
+		// 检查类型是否符合预期
+		modeArg, ok := c.Args[pos].(*prog.ConstArg)
+		if !ok {
+			return nil
+		}
+		devArg, ok := c.Args[pos+1].(*prog.ConstArg)
+		if !ok {
+			return nil
+		}
+		mode := modeArg
+		dev := devArg
 		dev.Val = uint64(uint32(dev.Val))
 		// Char and block devices read/write io ports, kernel memory and do other nasty things.
 		// TODO: not required if executor drops privileges.
@@ -122,7 +144,16 @@ func (arch *UnixNeutralizer) Neutralize(c *prog.Call, fixStructure bool) error {
 			mode.Val |= arch.S_IFREG
 		}
 	case "exit", "exit_group":
-		code := c.Args[0].(*prog.ConstArg)
+		// 检查参数数量是否足够
+		if len(c.Args) == 0 {
+			return nil // 没有参数，跳过处理
+		}
+		// 检查类型是否为ConstArg
+		codeArg, ok := c.Args[0].(*prog.ConstArg)
+		if !ok {
+			return nil
+		}
+		code := codeArg
 		// This code is reserved by executor.
 		if code.Val%128 == 67 {
 			code.Val = 1

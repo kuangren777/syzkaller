@@ -2285,6 +2285,12 @@ func (le *LLMEnhancer) enhanceWithLLM() {
 			continue
 		}
 
+		// 检查增强后的程序是否有调用
+		if len(enhancedProg.Calls) == 0 {
+			log.Logf(0, "【错误】LLM返回的程序没有调用 (耗时: %v)", callDuration)
+			continue
+		}
+
 		// 校验增强后的程序
 		enhancedHash := fmt.Sprintf("%x", sha1.Sum([]byte(enhancedProg.Serialize())))
 		log.Logf(0, "【调试】增强后程序哈希: %s", enhancedHash)

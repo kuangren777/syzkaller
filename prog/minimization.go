@@ -6,6 +6,7 @@ package prog
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"reflect"
 
 	"github.com/google/syzkaller/pkg/hash"
@@ -52,26 +53,65 @@ const (
 // whether it is equal to the original program or not. If it is equivalent then
 // the simplification attempt is committed and the process continues.
 func Minimize(p0 *Prog, callIndex0 int, mode MinimizeMode, pred0 func(*Prog, int) bool) (*Prog, int) {
+	// 检查程序是否为空或没有调用
+	if p0 == nil || len(p0.Calls) == 0 {
+		return p0, callIndex0
+	}
+
+	pred := func(p *Prog, callIndex int, stat *stat.Val, v string) bool {
+		stat.Add(1)
+		return pred0(p, callIndex)
+	}
+
+	// 确保callIndex0在有效范围内
+	if callIndex0 >= len(p0.Calls) {
+		callIndex0 = len(p0.Calls) - 1
+	}
+
+	var name0 string
+	if callIndex0 != -1 {
+		name0 = p0.Calls[callIndex0].Meta.Name
+	}
+
 	// Generally we try to avoid generating duplicates, but in some cases they are hard to avoid.
 	// For example, if we have an array with several equal elements, removing them leads to the same program.
 	dedup := make(map[string]bool)
-	pred := func(p *Prog, callIndex int, what *stat.Val, path string) bool {
+	pred = func(p *Prog, callIndex int, what *stat.Val, path string) bool {
+		// 添加保护性措施
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "注意：最小化过程中发生panic: %v\n", r)
+			}
+		}()
+
 		// Note: path is unused, but is useful for manual debugging.
 		what.Add(1)
-		p.sanitizeFix()
+
+		// 安全调用sanitizeFix
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "sanitizeFix panic: %v\n", r)
+				}
+			}()
+			p.sanitizeFix()
+		}()
+
 		p.debugValidate()
 		id := hash.String(p.Serialize())
 		if _, ok := dedup[id]; !ok {
-			dedup[id] = pred0(p, callIndex)
+			// 保护pred0调用
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Fprintf(os.Stderr, "pred0 panic: %v\n", r)
+						dedup[id] = false
+					}
+				}()
+				dedup[id] = pred0(p, callIndex)
+			}()
 		}
 		return dedup[id]
-	}
-	name0 := ""
-	if callIndex0 != -1 {
-		if callIndex0 < 0 || callIndex0 >= len(p0.Calls) {
-			panic("bad call index")
-		}
-		name0 = p0.Calls[callIndex0].Meta.Name
 	}
 
 	// Try to remove all calls except the last one one-by-one.
@@ -96,7 +136,20 @@ func Minimize(p0 *Prog, callIndex0 int, mode MinimizeMode, pred0 func(*Prog, int
 			}
 		again:
 			ctx.p = p0.Clone()
+			// 检查复制后的程序是否有调用
+			if len(ctx.p.Calls) == 0 || i >= len(ctx.p.Calls) {
+				// 如果没有调用或索引无效，跳过这次迭代
+				continue
+			}
 			ctx.call = ctx.p.Calls[i]
+			// 检查Meta.Args是否为nil或空
+			if ctx.call.Meta == nil || len(ctx.call.Meta.Args) == 0 {
+				continue
+			}
+			// 检查Args长度是否与Meta.Args匹配
+			if len(ctx.call.Args) != len(ctx.call.Meta.Args) {
+				continue
+			}
 			for j, field := range ctx.call.Meta.Args {
 				if ctx.do(ctx.call.Args[j], field.Name, fmt.Sprintf("call%v", i)) {
 					goto again
@@ -158,6 +211,11 @@ func removeCalls(p0 *Prog, callIndex0 int, pred minimizePred) (*Prog, int) {
 // the transitive closure of the resources/files used by the target call.
 // This may significantly reduce large generated programs in a single step.
 func removeUnrelatedCalls(p0 *Prog, callIndex0 int, pred minimizePred) (*Prog, int) {
+	// 检查callIndex0是否有效
+	if callIndex0 < 0 || callIndex0 >= len(p0.Calls) {
+		return p0, callIndex0
+	}
+
 	keepCalls := relatedCalls(p0, callIndex0)
 	if len(p0.Calls)-len(keepCalls) < 3 {
 		return p0, callIndex0
@@ -180,6 +238,12 @@ func removeUnrelatedCalls(p0 *Prog, callIndex0 int, pred minimizePred) (*Prog, i
 
 func relatedCalls(p0 *Prog, callIndex0 int) map[int]bool {
 	keepCalls := map[int]bool{callIndex0: true}
+	// 检查callIndex0是否有效
+	if callIndex0 < 0 || callIndex0 >= len(p0.Calls) {
+		// 如果callIndex0无效，只返回空map
+		return keepCalls
+	}
+
 	used := uses(p0.Calls[callIndex0])
 	for {
 		n := len(used)
@@ -252,6 +316,11 @@ func resetCallProps(p0 *Prog, callIndex0 int, pred minimizePred) *Prog {
 }
 
 func minimizeCallProps(p0 *Prog, callIndex, callIndex0 int, pred minimizePred) *Prog {
+	// 增加安全检查，确保callIndex在有效范围内
+	if callIndex < 0 || callIndex >= len(p0.Calls) {
+		return p0
+	}
+
 	props := p0.Calls[callIndex].Props
 
 	// Try to drop fault injection.

@@ -495,11 +495,28 @@ func (p *Prog) sanitizeFix() {
 }
 
 func (p *Prog) sanitize(fix bool) error {
+	// 保护模式，捕获可能的panic
+	var finalErr error
+
+	// 为每个调用添加保护
 	for _, c := range p.Calls {
-		if err := p.Target.sanitize(c, fix); err != nil {
-			return err
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					finalErr = fmt.Errorf("sanitize panic: %v", r)
+				}
+			}()
+
+			if err := p.Target.sanitize(c, fix); err != nil {
+				finalErr = err
+			}
+		}()
+
+		if finalErr != nil {
+			return finalErr
 		}
 	}
+
 	return nil
 }
 
