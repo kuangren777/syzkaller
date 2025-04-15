@@ -606,6 +606,13 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 		return nil
 	}
 
+	// 额外的安全检查，确保idx在有效范围内
+	if idx < 0 || idx >= len(r.target.Syscalls) {
+		fmt.Fprintf(os.Stderr, "警告：无效的系统调用索引 %d（共%d个系统调用），跳过生成\n",
+			idx, len(r.target.Syscalls))
+		return nil
+	}
+
 	meta := r.target.Syscalls[idx]
 	return r.generateParticularCall(s, meta)
 }

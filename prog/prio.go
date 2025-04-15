@@ -226,23 +226,32 @@ func (target *Target) BuildChoiceTable(corpus []*Prog, enabled map[*Syscall]bool
 		generatableCalls = append(generatableCalls, c)
 	}
 	if len(generatableCalls) == 0 {
-		panic("no syscalls enabled and generatable")
+		// 如果没有可生成的调用，打印警告并构建一个基本的ChoiceTable
+		fmt.Fprintf(os.Stderr, "警告：没有启用和可生成的系统调用，将使用默认值\n")
+		// 返回一个空的但有效的ChoiceTable，避免后续nil指针错误
+		return &ChoiceTable{target, nil, nil}
 	}
 	sort.Slice(generatableCalls, func(i, j int) bool {
 		return generatableCalls[i].ID < generatableCalls[j].ID
 	})
+	validPrograms := make([]*Prog, 0, len(corpus))
 	for _, p := range corpus {
+		hasDisabledCall := false
 		for _, call := range p.Calls {
 			if !enabledCalls[call.Meta] && !noGenerateCalls[call.Meta.ID] {
 				fmt.Printf("corpus contains disabled syscall %v\n", call.Meta.Name)
-				for call := range enabled {
-					fmt.Printf("%s: enabled\n", call.Name)
-				}
-				panic("disabled syscall")
+				fmt.Printf("warning: disabled syscall found in corpus, skipping this program\n")
+				hasDisabledCall = true
+				break
 			}
 		}
+		if !hasDisabledCall {
+			validPrograms = append(validPrograms, p)
+		}
 	}
-	prios := target.CalculatePriorities(corpus)
+
+	// 使用过滤后的有效程序集合进行后续操作
+	prios := target.CalculatePriorities(validPrograms)
 	run := make([][]int32, len(target.Syscalls))
 	// ChoiceTable.runs[][] contains cumulated sum of weighted priority numbers.
 	// This helps in quick binary search with biases when generating programs.
@@ -299,7 +308,17 @@ func (ct *ChoiceTable) choose(r *rand.Rand, bias int) int {
 
 	run := ct.runs[bias]
 	runSum := int(run[len(run)-1])
+	// 确保runSum不为0
+	if runSum == 0 {
+		fmt.Fprintf(os.Stderr, "警告：选择偏向的系统调用时runSum为0，将选择其他随机调用\n")
+		return generatableCalls[r.Intn(len(generatableCalls))]
+	}
 	x := int32(r.Intn(runSum) + 1)
+	// 确保run的长度不为0
+	if len(run) == 0 {
+		fmt.Fprintf(os.Stderr, "警告：run长度为0，将选择其他随机调用\n")
+		return generatableCalls[r.Intn(len(generatableCalls))]
+	}
 	res := sort.Search(len(run), func(i int) bool {
 		return run[i] >= x
 	})

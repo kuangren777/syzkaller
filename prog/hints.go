@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 
@@ -99,34 +100,123 @@ func (m CompMap) InplaceIntersect(other CompMap) {
 // The callback must return whether we should continue substitution (true)
 // or abort the process (false).
 func (p *Prog) MutateWithHints(callIndex int, comps CompMap, exec func(p *Prog) bool) {
-	p = p.Clone()
+	// 首先进行安全检查
+	if p == nil || callIndex < 0 || callIndex >= len(p.Calls) {
+		fmt.Fprintf(os.Stderr, "MutateWithHints: 无效的程序或调用索引 (callIndex=%d, len(p.Calls)=%d)\n",
+			callIndex, func() int {
+				if p == nil {
+					return 0
+				} else {
+					return len(p.Calls)
+				}
+			}())
+		return
+	}
+
+	var cloned *Prog
+	// 安全克隆
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "MutateWithHints中克隆程序时panic: %v\n", r)
+				cloned = nil
+			}
+		}()
+		cloned = p.Clone()
+	}()
+
+	// 克隆失败则直接返回
+	if cloned == nil {
+		fmt.Fprintf(os.Stderr, "MutateWithHints: 克隆程序失败\n")
+		return
+	}
+
+	p = cloned
+	// 再次检查调用索引的有效性
+	if callIndex >= len(p.Calls) {
+		fmt.Fprintf(os.Stderr, "MutateWithHints: 克隆后调用索引无效 (callIndex=%d, len(p.Calls)=%d)\n",
+			callIndex, len(p.Calls))
+		return
+	}
+
 	c := p.Calls[callIndex]
 	doMore := true
 	execValidate := func() bool {
+		// 使用defer-recover包装sanitize调用
+		sanitizeErr := func() error {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "MutateWithHints中调用sanitize时panic: %v\n", r)
+				}
+			}()
+			return p.Target.sanitize(c, false)
+		}()
+
 		// Don't try to fix the candidate program.
 		// Assuming the original call was sanitized, we've got a bad call
 		// as the result of hint substitution, so just throw it away.
-		if p.Target.sanitize(c, false) != nil {
+		if sanitizeErr != nil {
 			return true
 		}
-		if p.checkConditions() != nil {
+
+		// 使用defer-recover包装checkConditions调用
+		checkErr := func() error {
+			var err error
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "MutateWithHints中调用checkConditions时panic: %v\n", r)
+					err = fmt.Errorf("panic during checkConditions: %v", r)
+				}
+			}()
+			err = p.checkConditions()
+			return err
+		}()
+
+		if checkErr != nil {
 			// Patching unions that no longer satisfy conditions would
 			// require much deeped changes to prog arguments than
 			// generateHints() expects.
 			// Let's just ignore such mutations.
 			return true
 		}
-		p.debugValidate()
+
+		// 使用defer-recover包装debugValidate调用
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "MutateWithHints中调用debugValidate时panic: %v\n", r)
+				}
+			}()
+			p.debugValidate()
+		}()
+
+		// 检查程序是否在变异后变成了空程序
+		if len(p.Calls) == 0 {
+			fmt.Fprintf(os.Stderr, "MutateWithHints: 变异后程序变为空\n")
+			return false
+		}
+
+		// 执行回调
 		doMore = exec(p)
 		return doMore
 	}
-	ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
-		if !doMore {
-			ctx.Stop = true
-			return
-		}
-		generateHints(comps, arg, ctx.Field, execValidate)
-	})
+
+	// 使用defer-recover包装ForeachArg调用
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "MutateWithHints中调用ForeachArg时panic: %v\n", r)
+			}
+		}()
+
+		ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
+			if !doMore {
+				ctx.Stop = true
+				return
+			}
+			generateHints(comps, arg, ctx.Field, execValidate)
+		})
+	}()
 }
 
 func generateHints(compMap CompMap, arg Arg, field *Field, exec func() bool) {

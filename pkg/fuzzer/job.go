@@ -384,6 +384,20 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 		if stop {
 			return false
 		}
+
+		// 检查最小化过程中的程序是否有效
+		if p1 == nil || len(p1.Calls) == 0 {
+			job.info.Logf("[call #%d] 最小化过程中遇到空程序，跳过此次尝试", call)
+			return false
+		}
+
+		// 检查call1是否超出范围
+		if call1 >= 0 && call1 >= len(p1.Calls) {
+			job.info.Logf("[call #%d] 最小化过程中的调用索引超出范围: %d >= %d",
+				call, call1, len(p1.Calls))
+			return false
+		}
+
 		var mergedSignal signal.Signal
 		for i := 0; i < minimizeAttempts; i++ {
 			result := job.execute(&queue.Request{
@@ -474,6 +488,12 @@ type smashJob struct {
 }
 
 func (job *smashJob) run(fuzzer *Fuzzer) {
+	// 检查程序是否为空
+	if job.p == nil || len(job.p.Calls) == 0 {
+		fuzzer.Logf(1, "warning: smash job received empty program, skipping")
+		return
+	}
+
 	fuzzer.Logf(2, "smashing the program %s:", job.p)
 	job.info.Logf("\n%s", job.p.Serialize())
 
@@ -485,6 +505,13 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 			fuzzer.ChoiceTable(),
 			fuzzer.Config.NoMutateCalls,
 			fuzzer.Config.Corpus.Programs())
+
+		// 增加安全检查，如果程序为空，则跳过执行
+		if p == nil || len(p.Calls) == 0 {
+			fuzzer.Logf(1, "warning: mutated program has no calls, skipping execution")
+			continue
+		}
+
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
@@ -530,11 +557,45 @@ type faultInjectionJob struct {
 }
 
 func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
+	// 增加安全检查，确保程序和调用都有效
+	if job.p == nil || len(job.p.Calls) == 0 {
+		fuzzer.Logf(1, "warning: fault injection job received empty program, skipping")
+		return
+	}
+
+	// 检查调用索引是否有效
+	if job.call < 0 || job.call >= len(job.p.Calls) {
+		fuzzer.Logf(1, "warning: fault injection job received invalid call index %d (program has %d calls), skipping",
+			job.call, len(job.p.Calls))
+		return
+	}
+
 	for nth := 1; nth <= 100; nth++ {
 		fuzzer.Logf(2, "injecting fault into call %v, step %v",
 			job.call, nth)
-		newProg := job.p.Clone()
+
+		// 使用安全克隆
+		var newProg *prog.Prog
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fuzzer.Logf(0, "panic during program clone in fault injection: %v", r)
+					newProg = nil
+				}
+			}()
+			newProg = job.p.Clone()
+		}()
+
+		// 如果克隆失败，跳过此次循环
+		if newProg == nil || len(newProg.Calls) <= job.call {
+			fuzzer.Logf(1, "warning: fault injection clone failed or call index invalid, skipping")
+			continue
+		}
+
+		// 设置故障注入
 		newProg.Calls[job.call].Props.FailNth = nth
+
+		// 执行程序
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog: newProg,
 			Stat: fuzzer.statExecFaultInject,
@@ -558,6 +619,19 @@ type hintsJob struct {
 }
 
 func (job *hintsJob) run(fuzzer *Fuzzer) {
+	// 检查程序是否为空
+	if job.p == nil || len(job.p.Calls) == 0 {
+		fuzzer.Logf(1, "warning: hints job received empty program, skipping")
+		return
+	}
+
+	// 检查调用索引是否有效
+	if job.call < 0 || job.call >= len(job.p.Calls) {
+		fuzzer.Logf(1, "warning: hints job received invalid call index %d (program has %d calls), skipping",
+			job.call, len(job.p.Calls))
+		return
+	}
+
 	// First execute the original program several times to get comparisons from KCOV.
 	// Additional executions lets us filter out flaky values, which seem to constitute ~30-40%.
 	p := job.p
@@ -574,7 +648,7 @@ func (job *hintsJob) run(fuzzer *Fuzzer) {
 			return
 		}
 		job.info.Execs.Add(1)
-		if result.Info == nil || len(result.Info.Calls[job.call].Comps) == 0 {
+		if result.Info == nil || len(result.Info.Calls) <= job.call || result.Info.Calls[job.call].Comps == nil {
 			continue
 		}
 		got := make(prog.CompMap)
@@ -597,6 +671,13 @@ func (job *hintsJob) run(fuzzer *Fuzzer) {
 	// Execute each of such mutants to check if it gives new coverage.
 	p.MutateWithHints(job.call, comps,
 		func(p *prog.Prog) bool {
+			// 增加安全检查，如果程序为空，则跳过执行
+			if p == nil || len(p.Calls) == 0 {
+				job.info.Logf("warning: mutated program has no calls, skipping execution")
+				job.info.Execs.Add(1) // 仍然增加执行计数，避免计数不一致
+				return true
+			}
+
 			defer job.info.Execs.Add(1)
 			result := fuzzer.execute(job.exec, &queue.Request{
 				Prog:     p,

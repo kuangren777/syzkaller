@@ -4,7 +4,9 @@
 package prog
 
 import (
+	"fmt"
 	"math/rand"
+	"os"
 )
 
 // Generate generates a random program with ncalls calls.
@@ -15,8 +17,22 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
 	}
 	r := newRand(target, rs)
 	s := newState(target, ct, nil)
+	// 添加最大尝试次数
+	maxTries := ncalls * 10 // 为每个调用留出足够的尝试次数
+	tries := 0
 	for len(p.Calls) < ncalls {
+		tries++
+		if tries > maxTries {
+			// 如果尝试次数过多，打印警告并退出循环
+			fmt.Fprintf(os.Stderr, "警告：无法生成足够的系统调用，已尝试%d次\n", tries)
+			break
+		}
 		calls := r.generateCall(s, p, len(p.Calls))
+		// 检查generateCall是否返回nil
+		if calls == nil {
+			// 无法生成调用，但我们可以继续尝试
+			continue
+		}
 		for _, c := range calls {
 			s.analyze(c)
 			p.Calls = append(p.Calls, c)
@@ -29,7 +45,10 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
 	for len(p.Calls) > ncalls {
 		p.RemoveCall(ncalls - 1)
 	}
-	p.sanitizeFix()
+	// 添加空调用检查
+	if len(p.Calls) > 0 {
+		p.sanitizeFix()
+	}
 	p.debugValidate()
 	return p
 }

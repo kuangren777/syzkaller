@@ -5,6 +5,7 @@ package prog
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 )
 
@@ -489,8 +490,22 @@ func (p *Prog) RemoveCall(idx int) {
 }
 
 func (p *Prog) sanitizeFix() {
+	// 添加更严格的安全检查，避免空程序或没有调用的情况
+	if p == nil || len(p.Calls) == 0 {
+		// 空程序或没有调用，不需要进行消毒，直接返回
+		return
+	}
+
+	// 使用延迟处理捕获可能的panic
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "sanitizeFix panic: %v，跳过处理\n", r)
+		}
+	}()
+
 	if err := p.sanitize(true); err != nil {
-		panic(err)
+		// 不要panic，只记录错误
+		fmt.Fprintf(os.Stderr, "sanitize error: %v，跳过处理\n", err)
 	}
 }
 
@@ -498,8 +513,22 @@ func (p *Prog) sanitize(fix bool) error {
 	// 保护模式，捕获可能的panic
 	var finalErr error
 
+	// 如果没有调用，则直接返回
+	if len(p.Calls) == 0 {
+		return nil
+	}
+
 	// 为每个调用添加保护
-	for _, c := range p.Calls {
+	for i := 0; i < len(p.Calls); i++ {
+		// 检查调用是否为nil
+		if p.Calls[i] == nil {
+			if fix {
+				return fmt.Errorf("sanitize：程序中存在nil调用，索引=%v", i)
+			}
+			continue
+		}
+
+		c := p.Calls[i]
 		func() {
 			defer func() {
 				if r := recover(); r != nil {

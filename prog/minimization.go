@@ -94,7 +94,10 @@ func Minimize(p0 *Prog, callIndex0 int, mode MinimizeMode, pred0 func(*Prog, int
 					fmt.Fprintf(os.Stderr, "sanitizeFix panic: %v\n", r)
 				}
 			}()
-			p.sanitizeFix()
+			// 添加空调用检查
+			if len(p.Calls) > 0 {
+				p.sanitizeFix()
+			}
 		}()
 
 		p.debugValidate()

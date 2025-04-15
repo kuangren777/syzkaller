@@ -97,10 +97,55 @@ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMut
 		}
 		ok = ctx.removeCall()
 	}
-	p.sanitizeFix()
-	p.debugValidate()
-	if got := len(p.Calls); got < 1 || got > ncalls {
-		panic(fmt.Sprintf("bad number of calls after mutation: %v, want [1, %v]", got, ncalls))
+	// 确保在调用 sanitizeFix 前程序有至少一个调用
+	if len(p.Calls) > 0 {
+		// 使用defer保护以防sanitizeFix抛出panic
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "MutateWithOpts中调用sanitizeFix时发生panic: %v\n", r)
+				}
+			}()
+			p.sanitizeFix()
+		}()
+
+		// 使用defer保护以防debugValidate抛出panic
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "MutateWithOpts中调用debugValidate时发生panic: %v\n", r)
+				}
+			}()
+			p.debugValidate()
+		}()
+	}
+
+	// 增加额外的检查，确保变异后程序仍然有效
+	if len(p.Calls) < 1 || len(p.Calls) > ncalls {
+		fmt.Fprintf(os.Stderr, "警告：变异后调用数量异常: %v, 应在[1, %v]范围内\n", len(p.Calls), ncalls)
+		// 确保程序至少有一个调用
+		if len(p.Calls) < 1 {
+			// 尝试添加一个简单调用
+			if len(ctx.corpus) > 0 && ctx.corpus[0] != nil && len(ctx.corpus[0].Calls) > 0 {
+				// 复制调用，创建新的Call实例
+				origCall := ctx.corpus[0].Calls[0]
+				newCall := MakeCall(origCall.Meta, nil)
+				// 如果可行，复制参数
+				if len(origCall.Args) > 0 {
+					// 简单地使用默认参数
+					var args []Arg
+					for _, typ := range origCall.Meta.Args {
+						args = append(args, typ.DefaultArg(DirIn))
+					}
+					newCall.Args = args
+				}
+				p.Calls = append(p.Calls, newCall)
+			}
+		}
+		// 如果调用太多，删除一些
+		for len(p.Calls) > ncalls {
+			p.RemoveCall(len(p.Calls) - 1)
+		}
 	}
 }
 

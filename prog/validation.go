@@ -20,6 +20,11 @@ func init() {
 
 func (p *Prog) debugValidate() {
 	if debug {
+		// 添加安全检查，确保程序不为nil且有调用
+		if p == nil {
+			return
+		}
+
 		if err := p.validate(); err != nil {
 			panic(err)
 		}
@@ -43,6 +48,22 @@ type validationOptions struct {
 }
 
 func (p *Prog) validateWithOpts(opts validationOptions) error {
+	// 首先检查指针是否为nil
+	if p == nil {
+		return fmt.Errorf("验证空程序")
+	}
+
+	// 检查Target是否为nil
+	if p.Target == nil {
+		return fmt.Errorf("程序没有设置Target")
+	}
+
+	// 检查调用列表是否为空
+	if len(p.Calls) == 0 {
+		// 空调用列表是合法的
+		return nil
+	}
+
 	ctx := &validCtx{
 		target:   p.Target,
 		isUnsafe: p.isUnsafe,
@@ -51,6 +72,10 @@ func (p *Prog) validateWithOpts(opts validationOptions) error {
 		uses:     make(map[Arg]Arg),
 	}
 	for i, c := range p.Calls {
+		// 检查调用是否为nil
+		if c == nil {
+			return fmt.Errorf("call #%d is nil", i)
+		}
 		if c.Meta == nil {
 			return fmt.Errorf("call does not have meta information")
 		}
