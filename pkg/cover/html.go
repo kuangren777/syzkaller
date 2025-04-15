@@ -256,31 +256,31 @@ func (rg *ReportGenerator) DoCoverJSONL(w io.Writer, params HandlerParams) error
 	return nil
 }
 
-type CoveredBlock struct {
-	FromLine int `json:"from_line"`
-	FromCol  int `json:"from_column"`
-	ToLine   int `json:"to_line"`
-	ToCol    int `json:"to_column"`
-}
-
-type FunctionCoverage struct {
-	FuncName     string          `json:"func_name"`
-	Instrumented int             `json:"total_blocks,omitempty"`
-	Blocks       []*CoveredBlock `json:"covered_blocks"`
-}
-
-type FileCoverage struct {
-	Repo      string              `json:"repo,omitempty"`
-	Commit    string              `json:"commit,omitempty"`
-	FilePath  string              `json:"file_path"`
-	Functions []*FunctionCoverage `json:"functions"`
-}
-
 type ProgramCoverage struct {
 	Repo         string          `json:"repo,omitempty"`
 	Commit       string          `json:"commit,omitempty"`
 	Program      string          `json:"program"`
 	CoveredFiles []*FileCoverage `json:"coverage"`
+}
+
+type FileCoverage struct {
+	Repo      string          `json:"repo,omitempty"`
+	Commit    string          `json:"commit,omitempty"`
+	FilePath  string          `json:"file_path"`
+	Functions []*FuncCoverage `json:"functions"`
+}
+
+type FuncCoverage struct {
+	FuncName string   `json:"func_name"`
+	Blocks   []*Block `json:"blocks"`
+}
+
+type Block struct {
+	HitCount int `json:"hit_count,omitempty"`
+	FromLine int `json:"from_line"`
+	FromCol  int `json:"from_column"`
+	ToLine   int `json:"to_line"`
+	ToCol    int `json:"to_column"`
 }
 
 // DoCoverPrograms returns the corpus programs with the associated coverage.
@@ -312,22 +312,23 @@ func (rg *ReportGenerator) DoCoverPrograms(w io.Writer, params HandlerParams) er
 
 		var progCoverage []*FileCoverage
 		for filePath, functions := range fileFuncFrames {
-			var expFuncs []*FunctionCoverage
+			var expFuncs []*FuncCoverage
 			for funcName, frames := range functions {
-				var expCoveredBlocks []*CoveredBlock
+				var expCoveredBlocks []*Block
 				for _, frame := range frames {
 					endCol := frame.EndCol
 					if endCol == backend.LineEnd {
 						endCol = -1
 					}
-					expCoveredBlocks = append(expCoveredBlocks, &CoveredBlock{
+					expCoveredBlocks = append(expCoveredBlocks, &Block{
+						HitCount: 1,
 						FromCol:  frame.StartCol,
 						FromLine: frame.StartLine,
 						ToCol:    endCol,
 						ToLine:   frame.EndLine,
 					})
 				}
-				expFuncs = append(expFuncs, &FunctionCoverage{
+				expFuncs = append(expFuncs, &FuncCoverage{
 					FuncName: funcName,
 					Blocks:   expCoveredBlocks,
 				})
@@ -876,7 +877,7 @@ func addFunctionCoverage(file *file, data *templateData) {
 		percentage := ""
 		coveredTotal += function.covered
 		if function.covered > 0 {
-			percentage = fmt.Sprintf("%v%%", percent(function.covered, function.pcs))
+			percentage = fmt.Sprintf("%v%%", Percent(function.covered, function.pcs))
 			TotalInCoveredFunc += function.pcs
 		} else {
 			percentage = "---"
@@ -890,7 +891,7 @@ func addFunctionCoverage(file *file, data *templateData) {
 	buf.WriteString("<span class='hover'>SUMMARY")
 	percentInCoveredFunc := ""
 	if TotalInCoveredFunc > 0 {
-		percentInCoveredFunc = fmt.Sprintf("%v%%", percent(coveredTotal, TotalInCoveredFunc))
+		percentInCoveredFunc = fmt.Sprintf("%v%%", Percent(coveredTotal, TotalInCoveredFunc))
 	} else {
 		percentInCoveredFunc = "---"
 	}
@@ -914,21 +915,24 @@ func processDir(dir *templateDir) {
 	for _, f := range dir.Files {
 		dir.Total += f.Total
 		dir.Covered += f.Covered
-		f.Percent = percent(f.Covered, f.Total)
+		f.Percent = Percent(f.Covered, f.Total)
 	}
 	for _, child := range dir.Dirs {
 		processDir(child)
 		dir.Total += child.Total
 		dir.Covered += child.Covered
 	}
-	dir.Percent = percent(dir.Covered, dir.Total)
+	dir.Percent = Percent(dir.Covered, dir.Total)
 	if dir.Covered == 0 {
 		dir.Dirs = nil
 		dir.Files = nil
 	}
 }
 
-func percent[T int | int64](covered, total T) T {
+func Percent[T int | int64](covered, total T) T {
+	if total == 0 {
+		return 0
+	}
 	f := math.Ceil(float64(covered) / float64(total) * 100)
 	if f == 100 && covered < total {
 		f = 99

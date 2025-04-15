@@ -141,7 +141,6 @@ private:
   int sizeofType(const Type* T);
   int alignofType(const Type* T);
   void extractIoctl(const Expr* Cmd, const MacroDesc& Macro);
-  int getStmtLOC(const Stmt* S);
   std::optional<MacroDesc> isMacroRef(const Expr* E);
 };
 
@@ -206,13 +205,13 @@ std::string TypeName(QualType QT) {
 // Top function that converts any clang type QT to our output type.
 FieldType Extractor::genType(QualType QT, const std::string& BackupName) {
   const Type* T = QT.IgnoreParens().getUnqualifiedType().getDesugaredType(*Context).getTypePtr();
-  if (auto* Typ = llvm::dyn_cast<BuiltinType>(T)) {
+  if (llvm::isa<BuiltinType>(T)) {
     return IntType{.ByteSize = sizeofType(T), .Name = TypeName(QT), .Base = QualType(T, 0).getAsString()};
   }
   if (auto* Typ = llvm::dyn_cast<EnumType>(T)) {
     return IntType{.ByteSize = sizeofType(T), .Enum = extractEnum(Typ->getDecl())};
   }
-  if (auto* Typ = llvm::dyn_cast<FunctionProtoType>(T)) {
+  if (llvm::isa<FunctionProtoType>(T)) {
     return PtrType{.Elem = TodoType(), .IsConst = true};
   }
   if (auto* Typ = llvm::dyn_cast<IncompleteArrayType>(T)) {
@@ -281,7 +280,7 @@ FieldType Extractor::extractRecord(QualType QT, const RecordType* Typ, const std
       IsAnonymous = true;
     }
     FieldType FieldType = genType(F->getType(), BackupFieldName);
-    int BitWidth = F->isBitField() ? F->getBitWidthValue(*Context) : 0;
+    int BitWidth = F->isBitField() ? F->getBitWidthValue() : 0;
     int CountedBy = F->getType()->isCountAttributedType()
                         ? llvm::dyn_cast<FieldDecl>(
                               F->getType()->getAs<CountAttributedType>()->getCountExpr()->getReferencedDeclOfCallee())
@@ -356,11 +355,6 @@ std::string Extractor::getDeclFileID(const Decl* Decl) {
           .string();
   std::replace(file.begin(), file.end(), '-', '_');
   return file;
-}
-
-int Extractor::getStmtLOC(const Stmt* S) {
-  return std::max<int>(0, SourceManager->getExpansionLineNumber(S->getSourceRange().getEnd()) -
-                              SourceManager->getExpansionLineNumber(S->getSourceRange().getBegin()) - 1);
 }
 
 std::optional<MacroDesc> Extractor::isMacroRef(const Expr* E) {
@@ -494,7 +488,13 @@ int Extractor::alignofType(const Type* T) { return static_cast<int>(Context->get
 template <typename T> T Extractor::evaluate(const Expr* E) {
   Expr::EvalResult Res;
   E->EvaluateAsConstantExpr(Res, *Context);
-  return static_cast<T>(Res.Val.getInt().getExtValue());
+  // TODO: it's unclear what to do if it's not Int (in some cases we see None here).
+  if (Res.Val.getKind() != APValue::Int)
+    return 0;
+  auto val = Res.Val.getInt();
+  if (val.isSigned())
+    return val.sextOrTrunc(64).getSExtValue();
+  return val.zextOrTrunc(64).getZExtValue();
 }
 
 void Extractor::matchNetlinkPolicy() {
@@ -630,7 +630,7 @@ struct FunctionAnalyzer : RecursiveASTVisitor<FunctionAnalyzer> {
       : Extractor(Extractor), CurrentFunc(Func->getNameAsString()), Context(Extractor->Context),
         SourceManager(Extractor->SourceManager) {
     // The global function scope.
-    Scopes.push_back(FunctionScope{.Arg = -1, .LOC = Extractor->getStmtLOC(Func->getBody())});
+    Scopes.push_back(FunctionScope{.Arg = -1});
     Current = &Scopes[0];
     TraverseStmt(Func->getBody());
   }
@@ -686,11 +686,7 @@ struct FunctionAnalyzer : RecursiveASTVisitor<FunctionAnalyzer> {
       }
     }
 
-    int Begin = SourceManager->getExpansionLineNumber(S->getBeginLoc());
-    int End = SourceManager->getExpansionLineNumber(S->getEndLoc());
-    if (IsInteresting)
-      Scopes[0].LOC = std::max<int>(0, Scopes[0].LOC - (End - Begin));
-    SwitchStack.push({S, IsInteresting, IsInteresting ? static_cast<int>(Param->Argument->Arg) : -1, End});
+    SwitchStack.push({S, IsInteresting, IsInteresting ? static_cast<int>(Param->Argument->Arg) : -1});
     return true;
   }
 
@@ -705,10 +701,10 @@ struct FunctionAnalyzer : RecursiveASTVisitor<FunctionAnalyzer> {
     if (!C->getNextSwitchCase() || C->getNextSwitchCase()->getSubStmt() != C) {
       int Line = SourceManager->getExpansionLineNumber(C->getBeginLoc());
       if (Current != &Scopes[0])
-        Current->LOC = Line - Current->LOC;
+        Current->EndLine = Line;
       Scopes.push_back(FunctionScope{
           .Arg = SwitchStack.top().Arg,
-          .LOC = Line,
+          .StartLine = Line,
       });
       Current = &Scopes.back();
     }
@@ -744,7 +740,8 @@ struct FunctionAnalyzer : RecursiveASTVisitor<FunctionAnalyzer> {
     if (Top.S != S)
       return true;
     if (Top.IsInteresting) {
-      Current->LOC = Top.EndLine - Current->LOC;
+      if (Current != &Scopes[0])
+        Current->EndLine = SourceManager->getExpansionLineNumber(S->getEndLoc());
       Current = &Scopes[0];
     }
     SwitchStack.pop();
@@ -763,7 +760,6 @@ struct FunctionAnalyzer : RecursiveASTVisitor<FunctionAnalyzer> {
     const SwitchStmt* S;
     bool IsInteresting;
     int Arg;
-    int EndLine;
   };
 
   Extractor* Extractor;
@@ -781,12 +777,17 @@ void Extractor::matchFunctionDef() {
   const auto* Func = getResult<FunctionDecl>("function");
   if (!Func->getBody())
     return;
-  const std::string& SourceFile = std::filesystem::relative(
-      SourceManager->getFilename(SourceManager->getExpansionLoc(Func->getSourceRange().getBegin())).str());
+  auto Range = Func->getSourceRange();
+  const std::string& SourceFile =
+      std::filesystem::relative(SourceManager->getFilename(SourceManager->getExpansionLoc(Range.getBegin())).str());
+  const int StartLine = SourceManager->getExpansionLineNumber(Range.getBegin());
+  const int EndLine = SourceManager->getExpansionLineNumber(Range.getEnd());
   FunctionAnalyzer Analyzer(this, Func);
   Output.emit(Function{
       .Name = Func->getNameAsString(),
       .File = SourceFile,
+      .StartLine = StartLine,
+      .EndLine = EndLine,
       .IsStatic = Func->isStatic(),
       .Scopes = std::move(Analyzer.Scopes),
   });

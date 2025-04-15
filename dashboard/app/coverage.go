@@ -50,7 +50,7 @@ func GetCoverageDBClient(ctx context.Context) spannerclient.SpannerClient {
 
 type funcStyleBodyJS func(
 	ctx context.Context, client spannerclient.SpannerClient,
-	scope *coveragedb.SelectScope, onlyUnique bool, sss, managers []string,
+	scope *coveragedb.SelectScope, onlyUnique bool, sss, managers []string, dataFilters cover.Format,
 ) (template.CSS, template.HTML, template.HTML, error)
 
 func handleCoverageHeatmap(c context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -103,7 +103,14 @@ func handleHeatmap(c context.Context, w http.ResponseWriter, r *http.Request, f 
 		return fmt.Errorf("periods_count is wrong, expected [1, 12]: %w", err)
 	}
 
-	periods, err := coveragedb.GenNPeriodsTill(nPeriods, civil.DateOf(timeNow(c)), periodType)
+	dateTo := civil.DateOf(timeNow(c))
+	if customDate := r.FormValue("dateto"); customDate != "" {
+		if dateTo, err = civil.ParseDate(customDate); err != nil {
+			return fmt.Errorf("civil.ParseDate(%s): %w", customDate, err)
+		}
+	}
+
+	periods, err := coveragedb.GenNPeriodsTill(nPeriods, dateTo, periodType)
 	if err != nil {
 		return fmt.Errorf("%s: %w", err.Error(), ErrClientBadRequest)
 	}
@@ -120,6 +127,12 @@ func handleHeatmap(c context.Context, w http.ResponseWriter, r *http.Request, f 
 	slices.Sort(subsystems)
 
 	onlyUnique := r.FormValue("unique-only") == "1"
+	orderByCoverLinesDrop := r.FormValue("order-by-cover-lines-drop") == "1"
+	// Prefixing "0" we don't fail on empty string.
+	minCoverLinesDrop, err := strconv.Atoi("0" + r.FormValue("min-cover-lines-drop"))
+	if err != nil {
+		return fmt.Errorf("min-cover-lines-drop should be integer")
+	}
 
 	var style template.CSS
 	var body, js template.HTML
@@ -130,7 +143,12 @@ func handleHeatmap(c context.Context, w http.ResponseWriter, r *http.Request, f 
 			Manager:   manager,
 			Periods:   periods,
 		},
-		onlyUnique, subsystems, managers); err != nil {
+		onlyUnique, subsystems, managers,
+		cover.Format{
+			FilterMinCoveredLinesDrop: minCoverLinesDrop,
+			OrderByCoveredLinesDrop:   orderByCoverLinesDrop,
+			DropCoveredLines0:         onlyUnique,
+		}); err != nil {
 		return fmt.Errorf("failed to generate heatmap: %w", err)
 	}
 	return serveTemplate(w, "custom_content.html", struct {

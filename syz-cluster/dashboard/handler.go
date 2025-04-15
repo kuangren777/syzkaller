@@ -57,7 +57,9 @@ var staticFs embed.FS
 func (h *dashboardHandler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sessions/{id}/log", errToStatus(h.sessionLog))
+	mux.HandleFunc("/sessions/{id}/triage_log", errToStatus(h.sessionTriageLog))
 	mux.HandleFunc("/sessions/{id}/test_logs", errToStatus(h.sessionTestLog))
+	mux.HandleFunc("/sessions/{id}/test_artifacts", errToStatus(h.sessionTestArtifacts))
 	mux.HandleFunc("/series/{id}", errToStatus(h.seriesInfo))
 	mux.HandleFunc("/patches/{id}", errToStatus(h.patchContent))
 	mux.HandleFunc("/findings/{id}/{key}", errToStatus(h.findingInfo))
@@ -100,10 +102,11 @@ func (h *dashboardHandler) seriesList(w http.ResponseWriter, r *http.Request) er
 	baseURL := r.URL.RequestURI()
 	data := MainPageData{
 		Filter: db.SeriesFilter{
-			Cc:     r.FormValue("cc"),
-			Status: db.SessionStatus(r.FormValue("status")),
-			Limit:  perPage,
-			Offset: offset,
+			Cc:           r.FormValue("cc"),
+			Status:       db.SessionStatus(r.FormValue("status")),
+			WithFindings: r.FormValue("with_findings") != "",
+			Limit:        perPage,
+			Offset:       offset,
 		},
 		// If the filters are changed, the old offset value is irrelevant.
 		FilterFormURL: urlutil.DropParam(baseURL, "offset", ""),
@@ -221,6 +224,17 @@ func (h *dashboardHandler) sessionLog(w http.ResponseWriter, r *http.Request) er
 }
 
 // nolint:dupl
+func (h *dashboardHandler) sessionTriageLog(w http.ResponseWriter, r *http.Request) error {
+	session, err := h.sessionRepo.GetByID(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return err
+	} else if session == nil {
+		return fmt.Errorf("%w: session", errNotFound)
+	}
+	return h.streamBlob(w, session.TriageLogURI)
+}
+
+// nolint:dupl
 func (h *dashboardHandler) patchContent(w http.ResponseWriter, r *http.Request) error {
 	patch, err := h.seriesRepo.PatchByID(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -253,9 +267,22 @@ func (h *dashboardHandler) sessionTestLog(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return err
 	} else if test == nil {
-		return fmt.Errorf("%w: test log", errNotFound)
+		return fmt.Errorf("%w: test", errNotFound)
 	}
 	return h.streamBlob(w, test.LogURI)
+}
+
+func (h *dashboardHandler) sessionTestArtifacts(w http.ResponseWriter, r *http.Request) error {
+	test, err := h.sessionTestRepo.Get(r.Context(), r.PathValue("id"), r.FormValue("name"))
+	if err != nil {
+		return err
+	} else if test == nil {
+		return fmt.Errorf("%w: test", errNotFound)
+	}
+	filename := fmt.Sprintf("%s_%s.tar.gz", test.SessionID, test.TestName)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	return h.streamBlob(w, test.ArtifactsArchiveURI)
 }
 
 func (h *dashboardHandler) streamBlob(w http.ResponseWriter, uri string) error {
